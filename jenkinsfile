@@ -1,0 +1,947 @@
+pipeline {
+    agent any
+
+    triggers {
+        // GitHub 코드 푸시 시 자동 실행
+        githubPush()
+    }
+
+    tools {
+        "dependency-check" 'dependency-check'
+    }
+
+    stages {
+
+        stage('1. Workspace Init') {
+            steps {
+                sh """
+                    echo "== Init directories =="
+                    rm -rf ${WORKSPACE}/src ${WORKSPACE}/output
+                    mkdir -p ${WORKSPACE}/src
+                    mkdir -p ${WORKSPACE}/output
+                """
+            }
+        }
+
+        stage('2. Source Code Checkout') {
+            steps {
+                dir("${WORKSPACE}/src") {
+                    git url: 'https://github.com/juice-shop/juice-shop.git',
+                        branch: 'master'
+                    sh 'ls -la'
+                }
+            }
+        }
+
+        stage('3. Dependency Install') {
+            steps {
+                dir("${WORKSPACE}/src") {
+                    script {
+                        docker.image('node:20').inside('--user root') {
+                            sh """
+                                echo "== 버전 확인 =="
+                                node --version
+                                npm --version
+                                git --version
+
+                                echo "== npm install =="
+                                npm install --legacy-peer-deps
+
+                                echo "== package-lock.json 생성 (루트) =="
+                                npm install --package-lock-only --legacy-peer-deps --ignore-scripts
+
+                                echo "== package-lock.json 생성 (frontend) =="
+                                cd frontend && npm install --package-lock-only --legacy-peer-deps --ignore-scripts && cd ..
+
+                                echo "== lockfile 확인 =="
+                                ls -lh package-lock.json || echo "루트 lockfile 없음"
+                                ls -lh frontend/package-lock.json || echo "frontend lockfile 없음"
+
+                                echo "== npm audit (루트) JSON 저장 =="
+                                npm audit --json > ${WORKSPACE}/output/npm-audit-root.json 2>/dev/null || true
+
+                                echo "== npm audit (frontend) JSON 저장 =="
+                                cd frontend && npm audit --json > ${WORKSPACE}/output/npm-audit-frontend.json 2>/dev/null || true
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('4. Semgrep SAST Scan') {
+            steps {
+                dir("${WORKSPACE}/src") {
+                    script {
+                        docker.image('returntocorp/semgrep:latest').inside('--user root') {
+                            sh """
+                                echo "== Semgrep SAST 스캔 시작 =="
+                                semgrep --config=auto \\
+                                    --json \\
+                                    --output=${WORKSPACE}/output/semgrep-result.json \\
+                                    . || true
+                                echo "== Semgrep 완료 =="
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('5. Trivy SCA Scan') {
+            steps {
+                dir("${WORKSPACE}/src") {
+                    script {
+                        docker.image('aquasec/trivy:latest').inside('--user root --entrypoint= -v /tmp/trivy-cache:/root/.cache') {
+                            sh """
+                                echo "=== lockfile 확인 ==="
+                                ls -lh package-lock.json || echo "루트 lockfile 없음"
+                                ls -lh frontend/package-lock.json || echo "frontend lockfile 없음"
+
+                                echo "=== Trivy 루트 스캔 (package-lock 기반) ==="
+                                trivy fs \\
+                                    --scanners vuln \\
+                                    --pkg-types library \\
+                                    --format json \\
+                                    --output ${WORKSPACE}/output/trivy-result.json \\
+                                    --severity HIGH,CRITICAL \\
+                                    --include-dev-deps \\
+                                    --skip-dirs frontend \\
+                                    . || true
+
+                                echo "=== Trivy frontend 스캔 (package-lock 기반) ==="
+                                trivy fs \\
+                                    --scanners vuln \\
+                                    --pkg-types library \\
+                                    --format json \\
+                                    --output ${WORKSPACE}/output/trivy-frontend-result.json \\
+                                    --severity HIGH,CRITICAL \\
+                                    --include-dev-deps \\
+                                    ./frontend || true
+
+                                echo "=== Trivy node_modules 직접 스캔 ==="
+                                trivy fs \\
+                                    --scanners vuln \\
+                                    --pkg-types library \\
+                                    --format json \\
+                                    --output ${WORKSPACE}/output/trivy-nodemodules-result.json \\
+                                    --severity HIGH,CRITICAL \\
+                                    ${WORKSPACE}/src/node_modules || true
+
+                                echo "=== Trivy SBOM 스캔 (bom.json 기반) ==="
+                                if [ -f ${WORKSPACE}/src/frontend/dist/bom/bom.json ]; then
+                                    trivy sbom \\
+                                        --format json \\
+                                        --output ${WORKSPACE}/output/trivy-sbom-result.json \\
+                                        --severity HIGH,CRITICAL \\
+                                        ${WORKSPACE}/src/frontend/dist/bom/bom.json || true
+                                    echo "== SBOM 스캔 완료 =="
+                                else
+                                    echo "⚠️ bom.json 없음 — SBOM 스캔 스킵"
+                                fi
+
+                                echo "== Trivy 전체 완료 =="
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('6. OWASP Dependency Check') {
+            steps {
+                dir("${WORKSPACE}/src") {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        withCredentials([string(credentialsId: 'NVD_API_KEY', variable: 'NVD_KEY')]) {
+                            dependencyCheck(
+                                odcInstallation: 'dependency-check',
+                                additionalArguments: '--nvdApiKey $NVD_KEY --format JSON --format HTML --format XML --out $WORKSPACE/output --scan . --disableYarnAudit --disableOssIndex --data /var/jenkins_home/owasp-data'
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // stage 6.5 — Trivy + OWASP + npm audit CVE 병합 및 중복 제거
+        // source_count 필드 포함 → stage 7 신뢰도 가중치에 활용
+        // =====================================================================
+        stage('6.5. CVE Merge & Dedup') {
+            steps {
+                script {
+                    def outputFile = "${WORKSPACE}/output/merged_vulns.json"
+                    sh "rm -f ${outputFile}"
+
+                    def anyTrivy = fileExists("${WORKSPACE}/output/trivy-result.json") ||
+                                   fileExists("${WORKSPACE}/output/trivy-frontend-result.json")
+                    if (!anyTrivy) {
+                        echo "⚠️ Trivy 결과 파일 없음 — CVE 병합 스킵"
+                        return
+                    }
+
+                    writeFile file: "${WORKSPACE}/output/merge_vulns.py", text: '''
+import json, xml.etree.ElementTree as ET, os, re
+from collections import Counter
+
+WS = os.environ["WORKSPACE"]
+
+TRIVY_FILES = [
+    WS + "/output/trivy-result.json",
+    WS + "/output/trivy-frontend-result.json",
+    WS + "/output/trivy-nodemodules-result.json",
+    WS + "/output/trivy-sbom-result.json"
+]
+OWASP_FILE  = WS + "/output/dependency-check-report.xml"
+NPM_FILES   = [
+    WS + "/output/npm-audit-root.json",
+    WS + "/output/npm-audit-frontend.json"
+]
+OUTPUT_FILE = WS + "/output/merged_vulns.json"
+
+SEV_MAP = {
+    "critical": "CRITICAL", "high": "HIGH",
+    "moderate": "MEDIUM",   "medium": "MEDIUM",
+    "low": "LOW",           "info": "INFO"
+}
+def norm_sev(s):
+    return SEV_MAP.get((s or "").lower(), "UNKNOWN")
+
+def parse_trivy(paths):
+    vulns = {}
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        for result in data.get("Results", []):
+            for v in result.get("Vulnerabilities") or []:
+                vid = v.get("VulnerabilityID")
+                if not vid:
+                    continue
+                cvss = 0.0
+                for src in (v.get("CVSS") or {}).values():
+                    cvss = max(cvss, float(src.get("V3Score") or src.get("V2Score") or 0))
+                if vid not in vulns or cvss > vulns[vid]["cvss"]:
+                    vulns[vid] = {
+                        "vuln_id" : vid,
+                        "package" : v.get("PkgName", ""),
+                        "version" : v.get("InstalledVersion", ""),
+                        "severity": v.get("Severity", "UNKNOWN"),
+                        "cvss"    : cvss,
+                        "source"  : "trivy"
+                    }
+    print("[Trivy]     " + str(len(vulns)) + "개 (루트+frontend+node_modules+SBOM 합산)")
+    return vulns
+
+def parse_owasp(path):
+    vulns = {}
+    if not os.path.exists(path):
+        print("[OWASP]     파일 없음 — 스킵")
+        return vulns
+    tree = ET.parse(path)
+    root = tree.getroot()
+    ns  = root.tag.split("}")[0].strip("{") if "}" in root.tag else ""
+    tag = lambda t: ("{" + ns + "}" + t) if ns else t
+
+    for dep in root.iter(tag("dependency")):
+        raw = dep.findtext(tag("fileName")) or ""
+        pkg = re.sub(r"\\.(tgz|jar|zip|tar\\.gz|war|ear)$", "", raw)
+        pkg = re.sub(r"-[\\d]+\\.[\\d].*$", "", pkg).lower().strip()
+
+        for vuln in dep.iter(tag("vulnerability")):
+            vid = vuln.findtext(tag("name")) or ""
+            if not (vid.startswith("CVE-") or vid.startswith("GHSA-")):
+                continue
+            try:
+                cvss = float(
+                    vuln.findtext(tag("cvssV3")) or
+                    vuln.findtext(tag("cvssScore")) or 0
+                )
+            except ValueError:
+                cvss = 0.0
+            sev = norm_sev(vuln.findtext(tag("severity")) or "")
+            if vid not in vulns or cvss > vulns[vid]["cvss"]:
+                vulns[vid] = {
+                    "vuln_id" : vid,
+                    "package" : pkg,
+                    "version" : "",
+                    "severity": sev,
+                    "cvss"    : cvss,
+                    "source"  : "owasp"
+                }
+    print("[OWASP]     " + str(len(vulns)) + "개")
+    return vulns
+
+def parse_npm(paths):
+    vulns = {}
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError:
+                continue
+        for pkg_name, info in (data.get("vulnerabilities") or {}).items():
+            sev = norm_sev(info.get("severity", ""))
+            for via in (info.get("via") or []):
+                if not isinstance(via, dict):
+                    continue
+                vid = via.get("cve", "")
+                if not vid:
+                    url = via.get("url", "")
+                    if "GHSA-" in url:
+                        vid = "GHSA-" + url.split("GHSA-")[-1].split("/")[0].split(" ")[0]
+                    elif via.get("source"):
+                        vid = "NPM-" + str(via.get("source"))
+                    else:
+                        continue
+                cvss_info = via.get("cvss") or {}
+                cvss = float(cvss_info.get("score") or 0)
+                if cvss == 0.0:
+                    cvss = {"CRITICAL": 9.0, "HIGH": 7.5, "MEDIUM": 5.0, "LOW": 2.0}.get(sev, 0.0)
+                if vid not in vulns or cvss > vulns[vid]["cvss"]:
+                    vulns[vid] = {
+                        "vuln_id" : vid,
+                        "package" : pkg_name,
+                        "version" : info.get("range", ""),
+                        "severity": sev,
+                        "cvss"    : cvss,
+                        "source"  : "npm"
+                    }
+    print("[npm audit] " + str(len(vulns)) + "개")
+    return vulns
+
+def merge(trivy, owasp, npm):
+    all_ids = set(trivy) | set(owasp) | set(npm)
+    merged  = []
+    for vid in sorted(all_ids):
+        sources = []
+        entry   = None
+        if vid in trivy:
+            entry = trivy[vid].copy()
+            sources.append("trivy")
+        if vid in npm:
+            sources.append("npm")
+            if entry is None:
+                entry = npm[vid].copy()
+            else:
+                entry["cvss"] = max(entry["cvss"], npm[vid]["cvss"])
+        if vid in owasp:
+            sources.append("owasp")
+            if entry is None:
+                entry = owasp[vid].copy()
+            else:
+                entry["cvss"] = max(entry["cvss"], owasp[vid]["cvss"])
+        entry["source"]       = "+".join(sources)
+        entry["source_count"] = len(sources)
+        merged.append(entry)
+    merged.sort(key=lambda x: x["cvss"], reverse=True)
+    return merged
+
+trivy  = parse_trivy(TRIVY_FILES)
+owasp  = parse_owasp(OWASP_FILE)
+npm    = parse_npm(NPM_FILES)
+merged = merge(trivy, owasp, npm)
+
+src_counter = Counter()
+for v in merged:
+    for s in v["source"].split("+"):
+        src_counter[s] += 1
+
+print("[병합 결과] 총 " + str(len(merged)) + "개 고유 취약점")
+print("  trivy 포함   : " + str(src_counter.get("trivy", 0)) + "개")
+print("  npm 포함     : " + str(src_counter.get("npm",   0)) + "개")
+print("  owasp 포함   : " + str(src_counter.get("owasp", 0)) + "개")
+print("  3개 모두     : " + str(sum(1 for v in merged if v["source_count"] == 3)) + "개")
+print("  2개 소스     : " + str(sum(1 for v in merged if v["source_count"] == 2)) + "개")
+print("  단독         : " + str(sum(1 for v in merged if v["source_count"] == 1)) + "개")
+
+with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+    json.dump(merged, f, indent=2, ensure_ascii=False)
+print("[저장]      " + OUTPUT_FILE)
+'''
+
+                    sh "python3 ${WORKSPACE}/output/merge_vulns.py"
+                }
+            }
+            post {
+                failure {
+                    echo "❌ CVE 병합 실패 — 이전 stage 결과를 확인하세요."
+                }
+            }
+        }
+
+        // =====================================================================
+        // stage 6.7 — Swagger(OpenAPI) 분석
+        // swagger.yml 파싱 → endpoint별 path/method/bizScore 산정
+        // 결과 → output/swagger-analysis.json
+        // stage 7에서 publicRoutes 보완 및 외부공개(+2) 정확도 향상에 활용
+        // catchError: 실패해도 7, 8 stage 계속 진행
+        // =====================================================================
+        stage('6.7. Swagger Analysis') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                    def swaggerFile  = "${WORKSPACE}/src/swagger.yml"
+                    def outputFile   = "${WORKSPACE}/output/swagger-analysis.json"
+                    sh "rm -f ${outputFile}"
+
+                    if (!fileExists(swaggerFile)) {
+                        echo "⚠️ swagger.yml 없음 — Swagger 분석 스킵"
+                        return
+                    }
+
+                    writeFile file: "${WORKSPACE}/output/parse_swagger.py", text: '''
+import json, os, re, sys
+
+try:
+    import yaml
+except ImportError:
+    import subprocess
+    # pip 없는 환경 대응: apt-get으로 설치
+    try:
+        subprocess.run(["apt-get", "install", "-y", "-q", "python3-yaml"],
+                       check=True, capture_output=True)
+    except Exception:
+        subprocess.run([sys.executable, "-m", "pip", "install", "pyyaml",
+                        "--break-system-packages", "-q"], check=True)
+    import yaml
+
+WS          = os.environ["WORKSPACE"]
+SWAGGER_FILE = WS + "/src/swagger.yml"
+OUTPUT_FILE  = WS + "/output/swagger-analysis.json"
+
+# 비즈니스 중요도 키워드 기준표 (stage 7과 동일)
+BIZ_CATEGORIES = [
+    {"name": "payment",   "score": 5, "keywords": ["pay", "payment", "checkout", "purchase",
+                                                     "billing", "charge", "refund", "transaction",
+                                                     "pg", "card", "bank", "stripe", "invoice"]},
+    {"name": "auth",      "score": 4, "keywords": ["auth", "login", "logout", "register", "signup",
+                                                     "password", "token", "oauth", "session",
+                                                     "credential", "jwt", "saml"]},
+    {"name": "admin",     "score": 4, "keywords": ["admin", "manager", "dashboard", "console",
+                                                     "superuser", "root", "config", "setting"]},
+    {"name": "inventory", "score": 4, "keywords": ["price", "stock", "inventory", "quantity",
+                                                     "discount", "product-edit"]},
+    {"name": "sandbox",   "score": 4, "keywords": ["vm", "sandbox", "eval", "execute", "template"]},
+    {"name": "personal",  "score": 3, "keywords": ["user", "profile", "personal", "privacy",
+                                                     "email", "phone", "address", "delivery",
+                                                     "shipping", "ssn", "kyc"]},
+    {"name": "coupon",    "score": 3, "keywords": ["coupon", "point", "voucher", "reward", "promo"]},
+    {"name": "security",  "score": 3, "keywords": ["sanitize", "xss", "escape", "helmet",
+                                                     "validator", "sql", "inject"]},
+    {"name": "product",   "score": 1, "keywords": ["product", "item", "catalog", "search",
+                                                     "list", "category"]},
+]
+
+# 외부 공개 HTTP 메서드
+PUBLIC_METHODS = {"get", "post", "put", "patch", "delete"}
+
+def get_biz_score(path_str):
+    p = path_str.lower()
+    for cat in BIZ_CATEGORIES:
+        for kw in cat["keywords"]:
+            if len(kw) >= 3 and kw in p:
+                return cat["score"], cat["name"], kw
+    return 0, "internal", ""
+
+with open(SWAGGER_FILE, encoding="utf-8") as f:
+    spec = yaml.safe_load(f)
+
+base_path = (spec.get("basePath") or "").rstrip("/")
+paths     = spec.get("paths") or {}
+
+endpoints = []
+summary   = {"total": 0, "by_category": {}, "by_method": {}, "high_risk": []}
+
+for path, path_item in paths.items():
+    if not isinstance(path_item, dict):
+        continue
+    for method, operation in path_item.items():
+        if method.lower() not in PUBLIC_METHODS:
+            continue
+        if not isinstance(operation, dict):
+            continue
+
+        full_path   = base_path + path
+        biz_score, biz_cat, matched_kw = get_biz_score(full_path)
+        is_public   = method.lower() in PUBLIC_METHODS
+        total_score = biz_score + (2 if is_public else 0)
+
+        entry = {
+            "path"        : full_path,
+            "method"      : method.upper(),
+            "summary"     : operation.get("summary", ""),
+            "tags"        : operation.get("tags", []),
+            "biz_category": biz_cat,
+            "biz_score"   : biz_score,
+            "matched_kw"  : matched_kw,
+            "is_public"   : is_public,
+            "total_score" : total_score,
+            "params"      : [p.get("name","") for p in (operation.get("parameters") or [])],
+            "auth_required": "security" in operation or "security" in spec
+        }
+        endpoints.append(entry)
+
+        summary["total"] += 1
+        summary["by_category"][biz_cat] = summary["by_category"].get(biz_cat, 0) + 1
+        summary["by_method"][method.upper()] = summary["by_method"].get(method.upper(), 0) + 1
+        if total_score >= 5:
+            summary["high_risk"].append(full_path + " [" + method.upper() + "] score=" + str(total_score))
+
+# 점수 높은 순 정렬
+endpoints.sort(key=lambda x: x["total_score"], reverse=True)
+
+result = {"endpoints": endpoints, "summary": summary}
+
+with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+    json.dump(result, f, indent=2, ensure_ascii=False)
+
+print("=== Swagger 분석 결과 ===")
+print("총 Endpoint  : " + str(summary["total"]) + "개")
+print("메서드 분포  : " + str(summary["by_method"]))
+print("카테고리 분포: " + str(summary["by_category"]))
+print("")
+print("--- 고위험 Endpoint (score >= 5) ---")
+for ep in summary["high_risk"]:
+    print("  " + ep)
+print("[저장] " + OUTPUT_FILE)
+'''
+
+                    sh "python3 ${WORKSPACE}/output/parse_swagger.py"
+                    }
+                }
+            }
+        }
+
+        stage('7. Business Context Analysis') {
+            steps {
+                dir("${WORKSPACE}/src") {
+                    script {
+
+                        def businessKeywords = [
+                            payment  : [score: 5, keywords: ['pay', 'payment', 'checkout', 'purchase', 'billing',
+                                                              'charge', 'refund', 'transaction', 'pg', 'card', 'bank',
+                                                              'stripe', 'braintree', 'paypal', 'invoice', 'receipt']],
+                            auth     : [score: 4, keywords: ['auth', 'jwt', 'jsonwebtoken', 'token', 'oauth',
+                                                              'passport', 'session', 'credential', 'login', 'saml',
+                                                              'bcrypt', 'argon', 'scrypt', 'otplib', 'speakeasy',
+                                                              'cookie', 'csrf', 'cors']],
+                            admin    : [score: 4, keywords: ['admin', 'manager', 'dashboard', 'console',
+                                                              'superuser', 'root', 'system', 'config', 'setting']],
+                            inventory: [score: 4, keywords: ['price', 'stock', 'inventory', 'quantity',
+                                                              'product-edit', 'update-price', 'discount']],
+                            sandbox  : [score: 4, keywords: ['vm2', 'sandbox', 'serialize', 'deserializ',
+                                                              'template', 'handlebars', 'pug', 'ejs', 'nunjucks',
+                                                              'lodash', 'underscore', 'eval', 'expression',
+                                                              'notevil', 'safe-eval', 'isolated-vm']],
+                            personal : [score: 3, keywords: ['user', 'profile', 'personal', 'privacy', 'email',
+                                                              'phone', 'address', 'delivery', 'shipping', 'ssn',
+                                                              'kyc', 'user-info', 'pii', 'gdpr']],
+                            coupon   : [score: 3, keywords: ['coupon', 'point', 'voucher', 'reward',
+                                                              'promo', 'discount-code']],
+                            security : [score: 3, keywords: ['sanitize', 'sanitize-html', 'xss', 'escape',
+                                                              'helmet', 'validator', 'dompurify', 'marked',
+                                                              'sql', 'inject']],
+                            product  : [score: 1, keywords: ['product', 'item', 'catalog', 'search',
+                                                              'list', 'category']]
+                        ]
+
+                        def categoryOrder = [
+                            'payment', 'auth', 'admin', 'inventory', 'sandbox',
+                            'personal', 'coupon', 'security', 'product'
+                        ]
+
+                        // 신뢰도 가중치
+                        def TRUST_WEIGHTS = [1.0, 1.0, 1.15, 1.30]
+                        def MAX_RAW       = 136.5
+
+                        // ================================================================
+                        // Semgrep 결과 파싱
+                        // ================================================================
+                        def publicRoutes    = []
+                        def semgrepFindings = []
+
+                        if (fileExists("${WORKSPACE}/output/semgrep-result.json")) {
+                            def semgrepJson = readJSON file: "${WORKSPACE}/output/semgrep-result.json"
+                            semgrepJson.results?.each { finding ->
+                                def msg  = finding.extra?.message?.toLowerCase() ?: ''
+                                def rule = finding.check_id?.toLowerCase() ?: ''
+                                def file = finding.path?.toLowerCase() ?: ''
+
+                                semgrepFindings.add([
+                                    file   : finding.path,
+                                    rule   : rule,
+                                    message: msg
+                                ])
+
+                                if (msg.contains('/api/')   || msg.contains('/rest/')  ||
+                                    file.contains('route')  || file.contains('router') ||
+                                    rule.contains('route')  || rule.contains('express')) {
+                                    publicRoutes.add(msg)
+                                }
+                            }
+                            echo "== Semgrep Route 패턴 ${publicRoutes.size()}개 식별 =="
+                        }
+
+                        // ================================================================
+                        // Swagger 분석 결과 로드
+                        // swagger endpoint path를 publicRoutes에 추가
+                        // pkgName이 swagger path에 포함되면 외부공개(+2) 가산
+                        // ================================================================
+                        def swaggerEndpoints   = []
+                        def swaggerPublicPaths = []
+
+                        if (fileExists("${WORKSPACE}/output/swagger-analysis.json")) {
+                            def swaggerJson = readJSON file: "${WORKSPACE}/output/swagger-analysis.json"
+                            swaggerEndpoints = swaggerJson.endpoints ?: []
+                            swaggerEndpoints.each { ep ->
+                                swaggerPublicPaths.add(ep.path?.toLowerCase() ?: '')
+                            }
+                            echo "== Swagger Endpoint ${swaggerEndpoints.size()}개 로드 =="
+                        } else {
+                            echo "⚠️ swagger-analysis.json 없음 — Semgrep 결과만 사용"
+                        }
+
+                        // ================================================================
+                        // 취약점별 Risk Score 산정
+                        // ================================================================
+                        def vulnBusinessScores = []
+
+                        def sourceFiles = fileExists("${WORKSPACE}/output/merged_vulns.json")
+                            ? ["${WORKSPACE}/output/merged_vulns.json"]
+                            : ["${WORKSPACE}/output/trivy-result.json",
+                               "${WORKSPACE}/output/trivy-frontend-result.json"]
+
+                        sourceFiles.each { filePath ->
+                            if (!fileExists(filePath)) return
+
+                            def vulnList = []
+
+                            if (filePath.contains("merged_vulns")) {
+                                vulnList = readJSON file: filePath
+                            } else {
+                                def trivyJson = readJSON file: filePath
+                                trivyJson.Results?.each { result ->
+                                    result.Vulnerabilities?.each { v ->
+                                        def cvss = 0.0
+                                        if (v.CVSS) {
+                                            ['nvd', 'ghsa', 'redhat'].each { src ->
+                                                if (v.CVSS[src] && cvss == 0.0)
+                                                    cvss = (v.CVSS[src].V3Score ?:
+                                                            v.CVSS[src].V2Score ?: 0.0) as double
+                                            }
+                                        }
+                                        if (cvss == 0.0)
+                                            cvss = v.Severity == 'CRITICAL' ? 9.0 : 7.0
+                                        vulnList.add([
+                                            vuln_id      : v.VulnerabilityID ?: '',
+                                            package      : v.PkgName ?: '',
+                                            version      : v.InstalledVersion ?: '',
+                                            severity     : v.Severity ?: '',
+                                            cvss         : cvss,
+                                            source       : 'trivy',
+                                            source_count : 1
+                                        ])
+                                    }
+                                }
+                            }
+
+                            vulnList.each { vuln ->
+                                def cvssScore = (vuln.cvss ?: 0.0) as double
+                                if (cvssScore == 0.0)
+                                    cvssScore = (vuln.severity == 'CRITICAL') ? 9.0 : 7.0
+
+                                def pkgName     = (vuln.package ?: '').toLowerCase()
+                                def bizScore    = 0
+                                def bizCategory = '내부기능'
+                                def matchedKw   = ''
+
+                                // 카테고리 매핑
+                                for (int ci = 0; ci < categoryOrder.size(); ci++) {
+                                    if (bizScore > 0) break
+                                    def category = categoryOrder[ci]
+                                    def config   = businessKeywords[category]
+                                    for (int ki = 0; ki < config.keywords.size(); ki++) {
+                                        def keyword = config.keywords[ki]
+                                        if (keyword.length() >= 3 && pkgName.contains(keyword)) {
+                                            bizScore    = config.score
+                                            bizCategory = category
+                                            matchedKw   = keyword
+                                            break
+                                        }
+                                    }
+                                }
+
+                                // 외부 공개 여부 판단
+                                // 1) Semgrep publicRoutes에 패키지명 포함
+                                // 2) Swagger endpoint path에 패키지명 포함
+                                def isPublicBySemgrep = publicRoutes.any { route ->
+                                    route.contains(pkgName)
+                                }
+                                def isPublicBySwagger = swaggerPublicPaths.any { path ->
+                                    path.contains(pkgName)
+                                }
+                                def isPublicRoute = isPublicBySemgrep || isPublicBySwagger
+                                if (isPublicRoute) bizScore += 2
+
+                                // Swagger에서 직접 매핑: pkgName과 관련된 endpoint의 bizScore 활용
+                                // 패키지명과 swagger endpoint 카테고리가 일치하면 가중 반영
+                                def swaggerBonus = 0
+                                swaggerEndpoints.each { ep ->
+                                    def epPath = (ep.path ?: '').toLowerCase()
+                                    if (pkgName.length() >= 4 && epPath.contains(pkgName)) {
+                                        def epBizScore = (ep.biz_score ?: 0) as int
+                                        if (epBizScore > swaggerBonus) swaggerBonus = epBizScore
+                                    }
+                                }
+                                // swagger에서 더 높은 bizScore를 발견하면 업데이트
+                                if (swaggerBonus > bizScore) {
+                                    bizScore    = swaggerBonus
+                                    bizCategory = 'swagger-mapped'
+                                }
+
+                                // Reachability — 4자 이상 패키지명만 매칭
+                                def reachability = 1.0
+                                if (pkgName.length() >= 4) {
+                                    def isReachable = semgrepFindings.any { f ->
+                                        f.message?.contains(pkgName) ||
+                                        f.rule?.contains(pkgName)    ||
+                                        f.file?.contains(pkgName)
+                                    }
+                                    if (isReachable) reachability = 1.5
+                                }
+
+                                // 신뢰도 가중치
+                                def srcCount    = (vuln.source_count ?: 1) as int
+                                def trustIdx    = Math.min(srcCount, TRUST_WEIGHTS.size() - 1)
+                                def trustWeight = TRUST_WEIGHTS[trustIdx] as double
+
+                                // Risk Score = CVSS × Reachability × bizScore × 신뢰도
+                                def effectiveBiz = bizScore > 0 ? bizScore : 1
+                                def rawScore     = cvssScore * reachability * effectiveBiz * trustWeight
+                                def finalScore   = (rawScore / MAX_RAW) * 20.0
+
+                                def gate = finalScore >= 14.0 ? '🔴 차단(Block)' :
+                                           finalScore >=  8.0 ? '🟠 경고(Warn)'  :
+                                                                '🟢 정상(Pass)'
+
+                                vulnBusinessScores.add([
+                                    pkg         : vuln.package ?: '',
+                                    version     : vuln.version ?: '',
+                                    cve         : vuln.vuln_id ?: '',
+                                    severity    : vuln.severity ?: '',
+                                    cvss        : cvssScore,
+                                    bizCategory : bizCategory,
+                                    bizScore    : bizScore,
+                                    matchedKw   : matchedKw,
+                                    reachability: reachability,
+                                    trustWeight : trustWeight,
+                                    sourceCount : srcCount,
+                                    rawScore    : rawScore,
+                                    finalScore  : finalScore,
+                                    gate        : gate,
+                                    source      : vuln.source ?: ''
+                                ])
+                            }
+                        }
+
+                        // 버블소트
+                        def n = vulnBusinessScores.size()
+                        for (int i = 0; i < n - 1; i++) {
+                            for (int j = 0; j < n - i - 1; j++) {
+                                if ((vulnBusinessScores[j].finalScore as double) <
+                                    (vulnBusinessScores[j+1].finalScore as double)) {
+                                    def tmp = vulnBusinessScores[j]
+                                    vulnBusinessScores[j]   = vulnBusinessScores[j+1]
+                                    vulnBusinessScores[j+1] = tmp
+                                }
+                            }
+                        }
+
+                        def top10 = []
+                        def limit = vulnBusinessScores.size() > 10 ? 10 : vulnBusinessScores.size()
+                        for (int k = 0; k < limit; k++) { top10.add(vulnBusinessScores[k]) }
+
+                        echo "======================================================"
+                        echo "     비즈니스 중요도 기반 취약점 우선순위 TOP 10"
+                        echo "======================================================"
+                        for (int i = 0; i < top10.size(); i++) {
+                            def v        = top10[i]
+                            def rawStr   = String.format('%.1f', v.rawScore as double)
+                            def finalStr = String.format('%.2f', v.finalScore as double)
+                            def kwInfo   = v.matchedKw ? "(키워드:${v.matchedKw})" : ""
+                            def trustStr = String.format('%.2f', v.trustWeight as double)
+                            echo "${i+1}위 | ${v.cve} | ${v.pkg}@${v.version} [${v.source}]"
+                            echo "     CVSS:${v.cvss} | ${v.bizCategory}(+${v.bizScore})${kwInfo} | Reach:x${v.reachability} | 신뢰도:x${trustStr}(${v.sourceCount}개소스) | raw:${rawStr} → 최종:${finalStr}/20점 | ${v.gate}"
+                        }
+
+                        def blockCount = 0
+                        def warnCount  = 0
+                        def passCount  = 0
+                        vulnBusinessScores.each { v ->
+                            def s = v.finalScore as double
+                            if (s >= 14.0)     blockCount++
+                            else if (s >= 8.0) warnCount++
+                            else               passCount++
+                        }
+
+                        echo "======================================================"
+                        echo "  🔴 차단(Block) : ${blockCount}건 (14점 이상/20점)"
+                        echo "  🟠 경고(Warn)  : ${warnCount}건  (8~13점/20점)"
+                        echo "  🟢 정상(Pass)  : ${passCount}건  (0~7점/20점)"
+                        echo "======================================================"
+
+                        writeJSON file: "${WORKSPACE}/output/business-risk-result.json",
+                                  json: vulnBusinessScores
+
+                        echo "== Business Context Analysis 완료 =="
+                    }
+                }
+            }
+        }
+
+        stage('8. Risk Scoring & Gate') {
+            steps {
+                script {
+                    def semgrepCount     = 0
+                    def mergedHighCount  = 0
+                    def mergedCritCount  = 0
+                    def npmHighCount     = 0
+                    def npmCritCount     = 0
+                    def maxFinalScore    = 0.0
+                    def blockCount       = 0
+                    def warnCount        = 0
+
+                    if (fileExists("${WORKSPACE}/output/semgrep-result.json")) {
+                        def json = readJSON file: "${WORKSPACE}/output/semgrep-result.json"
+                        semgrepCount = json.results?.size() ?: 0
+                    }
+
+                    if (fileExists("${WORKSPACE}/output/merged_vulns.json")) {
+                        def merged = readJSON file: "${WORKSPACE}/output/merged_vulns.json"
+                        merged.each { vuln ->
+                            def sev = (vuln.severity ?: '').toUpperCase()
+                            if (sev == 'HIGH')     mergedHighCount++
+                            if (sev == 'CRITICAL') mergedCritCount++
+                        }
+                    } else {
+                        ["${WORKSPACE}/output/trivy-result.json",
+                         "${WORKSPACE}/output/trivy-frontend-result.json"].each { filePath ->
+                            if (fileExists(filePath)) {
+                                def json = readJSON file: filePath
+                                json.Results?.each { result ->
+                                    result.Vulnerabilities?.each { vuln ->
+                                        if (vuln.Severity == 'HIGH')     mergedHighCount++
+                                        if (vuln.Severity == 'CRITICAL') mergedCritCount++
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    ["${WORKSPACE}/output/npm-audit-root.json",
+                     "${WORKSPACE}/output/npm-audit-frontend.json"].each { filePath ->
+                        if (fileExists(filePath)) {
+                            def json = readJSON file: filePath
+                            json.vulnerabilities?.each { name, vuln ->
+                                def sev = vuln.severity?.toUpperCase()
+                                if (sev == 'HIGH')     npmHighCount++
+                                if (sev == 'CRITICAL') npmCritCount++
+                            }
+                        }
+                    }
+
+                    if (fileExists("${WORKSPACE}/output/business-risk-result.json")) {
+                        def bizJson = readJSON file: "${WORKSPACE}/output/business-risk-result.json"
+                        bizJson.each { v ->
+                            def score = v.finalScore as double
+                            if (score > maxFinalScore) maxFinalScore = score
+                            if (score >= 14.0)     blockCount++
+                            else if (score >= 8.0) warnCount++
+                        }
+                    }
+
+                    // ── 취약점 가중치 우선 비율 기반 baseScore ────────────
+                    // CRITICAL 비율 × 100 (최대 100점) — 취약점 심각도 최우선
+                    // HIGH     비율 × 40  (최대 40점)
+                    // Semgrep  건수 × 0.2 (최대 ~9점)  — 보조 지표
+                    // 임계값: 차단 50점↑ / 경고 30점↑ / 정상 30점↓
+                    def totalVulns    = mergedHighCount + mergedCritCount
+                    def criticalRatio = totalVulns > 0 ? (mergedCritCount / totalVulns as double) : 0.0
+                    def highRatio     = totalVulns > 0 ? (mergedHighCount  / totalVulns as double) : 0.0
+                    def baseScore     = (criticalRatio * 100) + (highRatio * 40) + (semgrepCount * 0.2)
+                    def baseScoreStr  = String.format('%.1f', baseScore)
+                    def maxScoreStr   = String.format('%.2f', maxFinalScore)
+
+                    def critPctStr = String.format('%.1f', criticalRatio * 100)
+                    def highPctStr = String.format('%.1f', highRatio * 100)
+
+                    // Swagger 고위험 endpoint 수
+                    def swaggerHighRisk = 0
+                    if (fileExists("${WORKSPACE}/output/swagger-analysis.json")) {
+                        def swaggerJson = readJSON file: "${WORKSPACE}/output/swagger-analysis.json"
+                        swaggerHighRisk = swaggerJson.summary?.high_risk?.size() ?: 0
+                    }
+
+                    def baseGate = baseScore >= 50.0 ? '🔴 차단' :
+                                   baseScore >= 30.0 ? '🟠 경고' : '🟢 정상'
+
+                    echo """
+                    ======================================================
+                    Semgrep 발견              : ${semgrepCount}건
+                    병합 총 취약점            : ${totalVulns}건
+                      ├ CRITICAL             : ${mergedCritCount}건 (${critPctStr}%)
+                      └ HIGH                 : ${mergedHighCount}건 (${highPctStr}%)
+                    npm audit HIGH           : ${npmHighCount}건
+                    npm audit CRITICAL       : ${npmCritCount}건
+                    Swagger 고위험 Endpoint  : ${swaggerHighRisk}개 (score>=5)
+                    ---------------------------
+                    기본 리스크 점수         : ${baseScoreStr}점 ${baseGate}
+                      CRITICAL비율×100 = ${String.format('%.1f', criticalRatio * 100)}점
+                      HIGH비율×40      = ${String.format('%.1f', highRatio * 40)}점
+                      Semgrep×0.2      = ${String.format('%.1f', semgrepCount * 0.2)}점
+                    임계값: 차단 50점↑ / 경고 30점↑ / 정상 30점↓
+                    ---------------------------
+                    비즈니스 최고 점수       : ${maxScoreStr}/20점
+                    🔴 차단(Block) 14점 이상 : ${blockCount}건
+                    🟠 경고(Warn)  8~13점    : ${warnCount}건
+                    ======================================================
+                    """
+
+                    if (blockCount > 0) {
+                        error("🚨 비즈니스 차단(Block) 취약점 ${blockCount}건 발견 (14점/20점 이상)! 빌드 차단!")
+                    } else if (baseScore >= 50.0) {
+                        error("🚨 기본 리스크 점수 ${baseScoreStr}점 ≥ 임계값 50점! 빌드 차단!")
+                    } else if (baseScore >= 30.0) {
+                        echo "⚠️ 기본 리스크 점수 ${baseScoreStr}점 — 경고 구간 (30~50점), 배포 주의"
+                    } else {
+                        echo "✅ 리스크 점수 통과 (${baseScoreStr}점)"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'output/**', allowEmptyArchive: true
+            script {
+                if (fileExists('output/dependency-check-report.xml')) {
+                    dependencyCheckPublisher pattern: 'output/dependency-check-report.xml'
+                } else {
+                    echo "⚠️ OWASP 리포트 없음 - Publisher 스킵"
+                }
+            }
+            echo "결과: ${currentBuild.currentResult}"
+        }
+        success {
+            echo "✅ 파이프라인 성공"
+        }
+        failure {
+            echo "❌ 파이프라인 실패 - 로그를 확인하세요"
+        }
+    }
+}
