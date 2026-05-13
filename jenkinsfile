@@ -493,9 +493,9 @@ SERVER_FILE = WS + "/src/server.ts"
 if os.path.exists(SERVER_FILE):
     with open(SERVER_FILE, encoding="utf-8", errors="replace") as f:
         content = f.read()
-    # ★ 수정: raw string(r"...") 사용으로 SyntaxWarning 및 괄호 불일치 해소
+    # ★ 수정: 백슬래시 이중화(\\)로 SyntaxWarning 및 괄호 불일치 해소
     patterns = re.findall(
-        r"app\.(get|post|put|patch|delete)\s*\(\s*[\'\""]([^\'\"]+)[\'\""]",
+        "app\\.(get|post|put|patch|delete)\\s*\\(\\s*['\"]([^'\"]+)['\"]",
         content
     )
     server_count = 0
