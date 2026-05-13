@@ -493,11 +493,12 @@ SERVER_FILE = WS + "/src/server.ts"
 if os.path.exists(SERVER_FILE):
     with open(SERVER_FILE, encoding="utf-8", errors="replace") as f:
         content = f.read()
-    # ★ 수정: 백슬래시 이중화(\\)로 SyntaxWarning 및 괄호 불일치 해소
-    patterns = re.findall(
-        "app\\.(get|post|put|patch|delete)\\s*\\(\\s*['\"]([^'\"]+)['\"]",
-        content
-    )
+    # 백슬래시 없이 패턴 조합 (Groovy triple-quote 간섭 회피)
+    _dot   = chr(92) + "."
+    _ws    = chr(92) + "s*"
+    _lp    = chr(92) + "("
+    _pat   = "app" + _dot + "(get|post|put|patch|delete)" + _ws + _lp + _ws + "['\"]([^'\"]+)['\"]"
+    patterns = re.findall(_pat, content)
     server_count = 0
     for method, path in patterns:
         already_exists = any(
