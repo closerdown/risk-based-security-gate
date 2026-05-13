@@ -245,8 +245,9 @@ def parse_owasp(path):
 
     for dep in root.iter(tag("dependency")):
         raw = dep.findtext(tag("fileName")) or ""
-        pkg = re.sub(r"\.(tgz|jar|zip|tar\.gz|war|ear)$", "", raw)
-        pkg = re.sub(r"-[\d]+\.[\d].*$", "", pkg).lower().strip()
+        bs = chr(92)
+        pkg = re.sub(bs + ".(tgz|jar|zip|tar" + bs + ".gz|war|ear)$", "", raw)
+        pkg = re.sub(bs + "-[" + bs + "d]+[" + bs + ".][" + bs + "d].*$", "", pkg).lower().strip()
 
         for vuln in dep.iter(tag("vulnerability")):
             vid = vuln.findtext(tag("name")) or ""
@@ -1006,6 +1007,39 @@ trivy_pipe_build_status ${blockCount > 0 || baseScore >= 50.0 ? 0 : 1}
                 }
             }
         }
+
+        // =====================================================================
+        // stage 10 — 보안 결과 집계 + supplychain_* 메트릭 Pushgateway 전송
+        // 기존 stage 9의 trivy_pipe_* 메트릭은 그대로 유지
+        // 이 stage는 supplychain_* 신규 메트릭만 추가 전송
+        // security_metrics.py 위치: ${WORKSPACE}/output/security_metrics.py
+        // =====================================================================
+        stage('10. Security Metrics Push') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                        sh """
+                            echo "== prometheus_client 설치 확인 =="
+                            python3 -c "import prometheus_client" 2>/dev/null || \\
+                                python3 -m pip install prometheus_client --break-system-packages -q
+
+                            echo "== 보안 메트릭 집계 + 전송 시작 =="
+                            WORKSPACE=${WORKSPACE} \\
+                            PUSHGATEWAY_URL=pushgateway:9091 \\
+                            python3 ${WORKSPACE}/output/security_metrics.py
+
+                            echo "== 완료 =="
+                        """
+                    }
+                }
+            }
+            post {
+                failure {
+                    echo "❌ Security Metrics Push 실패 — 파이프라인은 계속 진행됩니다"
+                }
+            }
+        }
+
     } // stages 끝
 
     post {
