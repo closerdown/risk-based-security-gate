@@ -1028,11 +1028,10 @@ trivy_pipe_build_status ${blockCount > 0 || baseScore >= 50.0 ? 0 : 1}
                         sh """
                             echo "== prometheus_client 설치 확인 =="
                             if ! python3 -c "import prometheus_client" 2>/dev/null; then
-                                echo "pip 없음 — apt-get으로 설치 시도"
-                                apt-get update -qq && apt-get install -y -q python3-pip 2>/dev/null || true
-                                pip3 install prometheus_client -q 2>/dev/null || \\
-                                pip install prometheus_client -q 2>/dev/null || \\
-                                python3 -m ensurepip --upgrade 2>/dev/null && python3 -m pip install prometheus_client -q || true
+                                echo "prometheus_client 없음 — 설치 시도"
+                                apt-get update -qq 2>/dev/null || true
+                                apt-get install -y -q python3-pip 2>/dev/null || true
+                                python3 -m pip install prometheus_client --break-system-packages -q
                             fi
 
                             echo "== prometheus_client 최종 확인 =="
