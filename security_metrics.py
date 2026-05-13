@@ -36,22 +36,17 @@ except ImportError:
     import subprocess
 
     def _try_install():
-        # 방법 1: pip3 직접
-        r = subprocess.run(["pip3", "install", "prometheus_client", "-q"],
-                           capture_output=True)
-        if r.returncode == 0:
-            return True
-        # 방법 2: python3 -m pip
-        r = subprocess.run([sys.executable, "-m", "pip", "install",
-                            "prometheus_client", "-q"],
-                           capture_output=True)
-        if r.returncode == 0:
-            return True
-        # 방법 3: apt-get + pip3
+        # apt-get으로 pip 확보 후 python3 -m pip으로 설치
+        # (pip3와 python3의 경로가 다를 수 있으므로 python3 -m pip 사용)
+        subprocess.run(["apt-get", "update", "-qq"],
+                       capture_output=True)
         subprocess.run(["apt-get", "install", "-y", "-q", "python3-pip"],
                        capture_output=True)
-        r = subprocess.run(["pip3", "install", "prometheus_client", "-q"],
-                           capture_output=True)
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "install",
+             "prometheus_client", "--break-system-packages", "-q"],
+            capture_output=True
+        )
         return r.returncode == 0
 
     if not _try_install():
