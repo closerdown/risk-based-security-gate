@@ -1027,8 +1027,16 @@ trivy_pipe_build_status ${blockCount > 0 || baseScore >= 50.0 ? 0 : 1}
                     script {
                         sh """
                             echo "== prometheus_client 설치 확인 =="
-                            python3 -c "import prometheus_client" 2>/dev/null || \\
-                                python3 -m pip install prometheus_client --break-system-packages -q
+                            if ! python3 -c "import prometheus_client" 2>/dev/null; then
+                                echo "pip 없음 — apt-get으로 설치 시도"
+                                apt-get update -qq && apt-get install -y -q python3-pip 2>/dev/null || true
+                                pip3 install prometheus_client -q 2>/dev/null || \\
+                                pip install prometheus_client -q 2>/dev/null || \\
+                                python3 -m ensurepip --upgrade 2>/dev/null && python3 -m pip install prometheus_client -q || true
+                            fi
+
+                            echo "== prometheus_client 최종 확인 =="
+                            python3 -c "import prometheus_client; print('prometheus_client OK')"
 
                             echo "== 보안 메트릭 집계 + 전송 시작 =="
                             WORKSPACE=${WORKSPACE} \\
