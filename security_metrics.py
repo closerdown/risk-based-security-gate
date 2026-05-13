@@ -448,8 +448,16 @@ def push_metrics(agg: dict, risk: dict, confidence: dict,
         registry=registry
     )
     for item in top10:
-        pkg_label = item["package"][:60]   # 라벨 길이 제한
-        cve_label = item["cve"][:60] if item["cve"] else "N/A"
+        import re
+        # 특수문자 제거 — Prometheus 라벨은 영숫자, _, - 만 허용
+        pkg_raw = item["package"][:60]
+        cve_raw = item["cve"][:60] if item["cve"] else "N/A"
+        pkg_label = re.sub(r'[^a-zA-Z0-9_.:\-]', '_', pkg_raw)
+        cve_label = re.sub(r'[^a-zA-Z0-9_.:\-]', '_', cve_raw)
+        if not pkg_label:
+            pkg_label = "unknown"
+        if not cve_label:
+            cve_label = "N/A"
         g_pkg.labels(package=pkg_label, cve=cve_label).set(item["score"])
 
     # ── vulnerability_confidence_count{confidence} ────────────────────────
