@@ -1037,6 +1037,9 @@ trivy_pipe_build_status ${blockCount > 0 || baseScore >= 50.0 ? 0 : 1}
                             echo "== prometheus_client 최종 확인 =="
                             python3 -c "import prometheus_client; print('prometheus_client OK')"
 
+                            echo "== security_metrics.py 복사 =="
+                            cp ${WORKSPACE}/security_metrics.py ${WORKSPACE}/output/security_metrics.py
+
                             echo "== 보안 메트릭 집계 + 전송 시작 =="
                             WORKSPACE=${WORKSPACE} \\
                             PUSHGATEWAY_URL=pushgateway:9091 \\
