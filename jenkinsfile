@@ -168,10 +168,6 @@ pipeline {
             }
         }
 
-        // =====================================================================
-        // stage 6.5 — Trivy + OWASP + npm audit CVE 병합 및 중복 제거
-        // source_count 필드 포함 → stage 7 신뢰도 가중치에 활용
-        // =====================================================================
         stage('6.5. CVE Merge & Dedup') {
             steps {
                 script {
@@ -379,11 +375,6 @@ print("[저장]      " + OUTPUT_FILE)
             }
         }
 
-        // =====================================================================
-        // stage 6.7 — swagger.yml / swagger.json + server.ts 라우트 분석
-        // swagger 파일이 없으면 server.ts 라우트만 파싱
-        // 결과 → output/swagger-analysis.json
-        // =====================================================================
         stage('6.7. Swagger Analysis') {
             steps {
                 catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
@@ -455,7 +446,6 @@ def get_biz_score(path_str):
 endpoints = []
 summary   = {"total": 0, "by_category": {}, "by_method": {}, "high_risk": []}
 
-# ── Swagger 파싱 ──────────────────────────────────────────────────────────────
 if SWAGGER_FILE and os.path.exists(SWAGGER_FILE):
     print("[Swagger] 파싱: " + SWAGGER_FILE)
     with open(SWAGGER_FILE, encoding="utf-8") as f:
@@ -494,7 +484,6 @@ if SWAGGER_FILE and os.path.exists(SWAGGER_FILE):
 else:
     print("[Swagger] 파일 없음 — server.ts만 분석합니다")
 
-# ── server.ts 라우트 파싱 ─────────────────────────────────────────────────────
 SERVER_FILE = WS + "/src/server.ts"
 if os.path.exists(SERVER_FILE):
     with open(SERVER_FILE, encoding="utf-8", errors="replace") as f:
@@ -822,8 +811,14 @@ print("[저장] " + OUTPUT_FILE)
 
         // =====================================================================
         // stage 8 — Risk Scoring & Gate
-        // 비율 기반 점수 + 절댓값 하한선 병행 판정
-        // 둘 중 하나라도 걸리면 상위 등급 적용
+        //
+        // [juice-shop 전용 임계값 조정]
+        // juice-shop은 OWASP 교육용 의도적 취약 앱이므로
+        // 일반 프로젝트 기준보다 임계값을 높게 설정합니다.
+        //
+        // 비율 기반: 차단 80점↑ / 경고 60점↑  (기존: 50점↑/30점↑)
+        // 절댓값:    CRIT 차단≥50 / 경고≥30    (기존: 30/10)
+        //            HIGH 차단≥200 / 경고≥100   (기존: 100/50)
         // =====================================================================
         stage('8. Risk Scoring & Gate') {
             steps {
@@ -893,25 +888,22 @@ print("[저장] " + OUTPUT_FILE)
                         }
                     }
 
-                    // ── 비율 기반 점수 ──────────────────────────────────────
-                    // MEDIUM, LOW까지 포함한 전체를 분모로 사용 (100% 포화 방지)
                     def totalVulns    = mergedCritCount + mergedHighCount + mergedMedCount + mergedLowCount
                     def criticalRatio = totalVulns > 0 ? (mergedCritCount / totalVulns as double) : 0.0
                     def highRatio     = totalVulns > 0 ? (mergedHighCount  / totalVulns as double) : 0.0
                     def ratioScore    = (criticalRatio * 100) + (highRatio * 40) + (semgrepCount * 0.2)
 
-                    // ── 절댓값 하한선 ───────────────────────────────────────
-                    // 비율이 낮아도 절대 개수가 많으면 별도 판정
-                    // ※ 첫 스캔 결과 보고 프로젝트 규모에 맞게 조정 권장
-                    def CRIT_HARD_BLOCK = 30   // CRITICAL 30개 이상 → 무조건 차단
-                    def CRIT_HARD_WARN  = 10   // CRITICAL 10개 이상 → 경고
-                    def HIGH_HARD_BLOCK = 100  // HIGH 100개 이상 → 무조건 차단
-                    def HIGH_HARD_WARN  = 50   // HIGH 50개 이상 → 경고
+                    // ── [수정] juice-shop용 완화된 임계값 ──────────────────
+                    def CRIT_HARD_BLOCK = 50    // 기존 30  → 상향
+                    def CRIT_HARD_WARN  = 30    // 기존 10  → 상향
+                    def HIGH_HARD_BLOCK = 200   // 기존 100 → 상향
+                    def HIGH_HARD_WARN  = 100   // 기존 50  → 상향
+                    def RATIO_BLOCK     = 80.0  // 기존 50  → 상향
+                    def RATIO_WARN      = 60.0  // 기존 30  → 상향
 
                     def hardBlock = (mergedCritCount >= CRIT_HARD_BLOCK) || (mergedHighCount >= HIGH_HARD_BLOCK)
                     def hardWarn  = (mergedCritCount >= CRIT_HARD_WARN)  || (mergedHighCount >= HIGH_HARD_WARN)
 
-                    // ── 최종 판정 (비율 OR 절댓값 중 높은 쪽 적용) ──────────
                     def finalGate       = 'PASS'
                     def finalGateReason = ''
 
@@ -925,22 +917,23 @@ print("[저장] " + OUTPUT_FILE)
                             ? finalGateReason + " + 절댓값 초과(CRIT=${mergedCritCount}≥${CRIT_HARD_BLOCK} or HIGH=${mergedHighCount}≥${HIGH_HARD_BLOCK})"
                             : "절댓값 하한 초과 (CRIT=${mergedCritCount}≥${CRIT_HARD_BLOCK} or HIGH=${mergedHighCount}≥${HIGH_HARD_BLOCK})"
                     }
-                    if (ratioScore >= 50.0) {
+                    if (ratioScore >= RATIO_BLOCK) {
                         finalGate = 'BLOCK'
                         finalGateReason = finalGateReason
-                            ? finalGateReason + " + 비율점수 ${String.format('%.1f', ratioScore)}점≥50점"
-                            : "비율 점수 초과 (${String.format('%.1f', ratioScore)}점 ≥ 50점)"
+                            ? finalGateReason + " + 비율점수 ${String.format('%.1f', ratioScore)}점≥${RATIO_BLOCK}점"
+                            : "비율 점수 초과 (${String.format('%.1f', ratioScore)}점 ≥ ${RATIO_BLOCK}점)"
                     }
                     if (finalGate != 'BLOCK') {
-                        if (hardWarn || (ratioScore >= 30.0) || (warnCount > 0)) {
+                        if (hardWarn || (ratioScore >= RATIO_WARN) || (blockCount > 0)) {
                             finalGate = 'WARN'
                             def warnReasons = []
-                            if (ratioScore >= 30.0) warnReasons.add("비율점수 ${String.format('%.1f', ratioScore)}점≥30점")
+                            if (ratioScore >= RATIO_WARN) warnReasons.add("비율점수 ${String.format('%.1f', ratioScore)}점≥${RATIO_WARN}점")
                             if (mergedCritCount >= CRIT_HARD_WARN) warnReasons.add("CRIT=${mergedCritCount}≥${CRIT_HARD_WARN}")
                             if (mergedHighCount >= HIGH_HARD_WARN) warnReasons.add("HIGH=${mergedHighCount}≥${HIGH_HARD_WARN}")
-                            if (warnCount > 0) warnReasons.add("비즈니스 경고 취약점 ${warnCount}건")
+                            if (blockCount > 0) warnReasons.add("비즈니스 차단 취약점 ${blockCount}건")
                             finalGateReason = warnReasons.join(" + ")
                         }
+                        // warnCount만 있으면 → PASS (경고 취약점은 알림만, 빌드 결과 미반영)
                     }
 
                     def swaggerHighRisk = 0
@@ -965,7 +958,7 @@ print("[저장] " + OUTPUT_FILE)
     CRITICAL비율×100       = ${String.format('%.1f', criticalRatio * 100)}점
     HIGH비율×40            = ${String.format('%.1f', highRatio * 40)}점
     Semgrep×0.2            = ${String.format('%.1f', semgrepCount * 0.2)}점
-    임계값: 차단 50점↑ / 경고 30점↑
+    임계값: 차단 ${RATIO_BLOCK}점↑ / 경고 ${RATIO_WARN}점↑
 ------------------------------------------------------
   [절댓값 하한선]
     CRITICAL ${mergedCritCount}개  (차단≥${CRIT_HARD_BLOCK} / 경고≥${CRIT_HARD_WARN})  ${mergedCritCount >= CRIT_HARD_BLOCK ? '🔴 차단' : mergedCritCount >= CRIT_HARD_WARN ? '🟠 경고' : '🟢 통과'}
@@ -982,11 +975,9 @@ print("[저장] " + OUTPUT_FILE)
                     """
 
                     if (finalGate == 'BLOCK') {
-                        unstable("🚨 ${finalGateReason}")
-                        currentBuild.result = 'FAILURE'
+                        error("🚨 보안 게이트 차단: ${finalGateReason}")
                     } else if (finalGate == 'WARN') {
-                        echo "⚠️ 경고 구간 — 배포 주의"
-                        currentBuild.result = 'UNSTABLE'
+                        unstable("⚠️ 경고 구간 — 배포 주의: ${finalGateReason}")
                     } else {
                         echo "✅ 리스크 점수 통과"
                     }
@@ -1027,7 +1018,6 @@ print("[저장] " + OUTPUT_FILE)
                         else if (score >= 8.0) warnCount++
                     }
 
-                    // ── Semgrep 공격 표면 유형별 집계 ──────────────────────
                     def attackSurface = [
                         'sql-injection'    : 0,
                         'xss'              : 0,
@@ -1060,7 +1050,6 @@ print("[저장] " + OUTPUT_FILE)
                         }
                     }
 
-                    // ── 이전 빌드 대비 변화율 계산 ─────────────────────────
                     def prevCrit = 0
                     def prevHigh = 0
                     def prevMed  = 0
@@ -1126,7 +1115,7 @@ trivy_pipe_warn_count ${warnCount}
 trivy_pipe_semgrep_count ${semgrepCount}
 # HELP trivy_pipe_build_status 빌드 결과 (1=성공, 0=실패)
 # TYPE trivy_pipe_build_status gauge
-trivy_pipe_build_status ${blockCount > 0 || baseScore >= 50.0 ? 0 : 1}
+trivy_pipe_build_status ${blockCount > 0 || baseScore >= 80.0 ? 0 : 1}
 # HELP trivy_pipe_build_number 현재 빌드 번호
 # TYPE trivy_pipe_build_number gauge
 trivy_pipe_build_number ${buildNum}
@@ -1200,13 +1189,6 @@ trivy_pipe_attack_surface{type="other"} ${attackSurface['other']}
     post {
         always {
             archiveArtifacts artifacts: 'output/**', allowEmptyArchive: true
-            script {
-                if (fileExists('output/dependency-check-report.xml')) {
-                    dependencyCheckPublisher pattern: 'output/dependency-check-report.xml'
-                } else {
-                    echo "⚠️ OWASP 리포트 없음 - Publisher 스킵"
-                }
-            }
             echo "결과: ${currentBuild.currentResult}"
         }
         success {
@@ -1214,6 +1196,9 @@ trivy_pipe_attack_surface{type="other"} ${attackSurface['other']}
         }
         failure {
             echo "❌ 파이프라인 실패 - 로그를 확인하세요"
+        }
+        unstable {
+            echo "⚠️ 파이프라인 경고 - 보안 검토 필요"
         }
     }
 }
