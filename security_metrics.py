@@ -524,13 +524,23 @@ def main():
     attack_surface = parse_attack_surface()
     vuln_change    = calc_vuln_change(agg["by_severity"])
 
-    # ── [수정] build_status 판정 기준 완화 ───────────────────────────────────
-    # juice-shop은 의도적 취약 앱이므로 CRITICAL 단순 존재로 FAIL 처리 안 함
-    # Stage 7 비즈니스 게이트에서 14점↑ 차단 항목이 있을 때만 FAIL
+    # ── build_status 판정 (Stage 8 임계값과 동일 기준) ──────────────────────
+    # 비율점수 >= 40점 OR CRITICAL >= 10개 OR HIGH >= 70개 -> FAIL
+    by_sev       = agg["by_severity"]
+    crit_count   = by_sev.get("CRITICAL", 0)
+    high_count   = by_sev.get("HIGH", 0)
     block_count  = sum(1 for v in biz_risk if float(v.get("finalScore", 0)) >= 14.0)
-    build_status = 0 if (risk["risk_score"] >= 80.0 or block_count > 0) else 1
+    build_status = 0 if (
+        risk["risk_score"] >= 40.0 or
+        crit_count >= 10            or
+        high_count >= 70            or
+        block_count > 0
+    ) else 1
     log.info("[Build Status] " + ("PASS" if build_status == 1 else "FAIL") +
-             " (risk=" + str(risk['risk_score']) + ", block=" + str(block_count) + ")")
+             " (risk=" + str(risk["risk_score"]) +
+             ", crit=" + str(crit_count) +
+             ", high=" + str(high_count) +
+             ", block=" + str(block_count) + ")")
 
     log.info("[Top 10 패키지]")
     for i, item in enumerate(agg["top10_packages"], 1):
