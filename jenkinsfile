@@ -1,6 +1,6 @@
 pipeline {
     agent {
-        label 'built-in'  
+        label 'built-in'
     }
 
     options {
@@ -168,6 +168,10 @@ pipeline {
             }
         }
 
+        // =====================================================================
+        // stage 6.5 — Trivy + OWASP + npm audit CVE 병합 및 중복 제거
+        // source_count 필드 포함 → stage 7 신뢰도 가중치에 활용
+        // =====================================================================
         stage('6.5. CVE Merge & Dedup') {
             steps {
                 script {
@@ -375,6 +379,11 @@ print("[저장]      " + OUTPUT_FILE)
             }
         }
 
+        // =====================================================================
+        // stage 6.7 — swagger.yml / swagger.json + server.ts 라우트 분석
+        // swagger 파일이 없으면 server.ts 라우트만 파싱
+        // 결과 → output/swagger-analysis.json
+        // =====================================================================
         stage('6.7. Swagger Analysis') {
             steps {
                 catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
@@ -446,6 +455,7 @@ def get_biz_score(path_str):
 endpoints = []
 summary   = {"total": 0, "by_category": {}, "by_method": {}, "high_risk": []}
 
+# ── Swagger 파싱 ──────────────────────────────────────────────────────────────
 if SWAGGER_FILE and os.path.exists(SWAGGER_FILE):
     print("[Swagger] 파싱: " + SWAGGER_FILE)
     with open(SWAGGER_FILE, encoding="utf-8") as f:
@@ -484,6 +494,7 @@ if SWAGGER_FILE and os.path.exists(SWAGGER_FILE):
 else:
     print("[Swagger] 파일 없음 — server.ts만 분석합니다")
 
+# ── server.ts 라우트 파싱 ─────────────────────────────────────────────────────
 SERVER_FILE = WS + "/src/server.ts"
 if os.path.exists(SERVER_FILE):
     with open(SERVER_FILE, encoding="utf-8", errors="replace") as f:
@@ -495,8 +506,8 @@ if os.path.exists(SERVER_FILE):
     pat = "app" + bs + ".(get|post|put|patch|delete)" + bs + "s*" + bs + "(" + bs + "s*[" + sq + dq + "]([^" + sq + dq + "]+)[" + sq + dq + "]"
     patterns = re.findall(pat, content)
 
-    existing      = set((ep["path"], ep["method"]) for ep in endpoints)
-    server_count  = 0
+    existing     = set((ep["path"], ep["method"]) for ep in endpoints)
+    server_count = 0
 
     for method, path in patterns:
         if (path, method.upper()) in existing:
@@ -516,7 +527,9 @@ if os.path.exists(SERVER_FILE):
         summary["by_category"][biz_cat] = summary["by_category"].get(biz_cat, 0) + 1
         summary["by_method"][method.upper()] = summary["by_method"].get(method.upper(), 0) + 1
         if total_score >= 5:
-            summary["high_risk"].append(path + " [" + method.upper() + "] score=" + str(total_score) + " (server.ts)")
+            summary["high_risk"].append(
+                path + " [" + method.upper() + "] score=" + str(total_score) + " (server.ts)"
+            )
         server_count += 1
     print("[server.ts] " + str(server_count) + "개 라우트 추가")
 else:
@@ -527,7 +540,7 @@ endpoints.sort(key=lambda x: x["total_score"], reverse=True)
 with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
     json.dump({"endpoints": endpoints, "summary": summary}, f, indent=2, ensure_ascii=False)
 
-print("=== Swagger 분석 결과 ===")
+print("=== Swagger/server.ts 분석 결과 ===")
 print("총 Endpoint  : " + str(summary["total"]) + "개")
 print("메서드 분포  : " + str(summary["by_method"]))
 print("카테고리 분포: " + str(summary["by_category"]))
@@ -807,17 +820,24 @@ print("[저장] " + OUTPUT_FILE)
             }
         }
 
+        // =====================================================================
+        // stage 8 — Risk Scoring & Gate
+        // 비율 기반 점수 + 절댓값 하한선 병행 판정
+        // 둘 중 하나라도 걸리면 상위 등급 적용
+        // =====================================================================
         stage('8. Risk Scoring & Gate') {
             steps {
                 script {
-                    def semgrepCount     = 0
-                    def mergedHighCount  = 0
-                    def mergedCritCount  = 0
-                    def npmHighCount     = 0
-                    def npmCritCount     = 0
-                    def maxFinalScore    = 0.0
-                    def blockCount       = 0
-                    def warnCount        = 0
+                    def semgrepCount    = 0
+                    def mergedCritCount = 0
+                    def mergedHighCount = 0
+                    def mergedMedCount  = 0
+                    def mergedLowCount  = 0
+                    def npmHighCount    = 0
+                    def npmCritCount    = 0
+                    def maxFinalScore   = 0.0
+                    def blockCount      = 0
+                    def warnCount       = 0
 
                     if (fileExists("${WORKSPACE}/output/semgrep-result.json")) {
                         def json = readJSON file: "${WORKSPACE}/output/semgrep-result.json"
@@ -828,8 +848,10 @@ print("[저장] " + OUTPUT_FILE)
                         def merged = readJSON file: "${WORKSPACE}/output/merged_vulns.json"
                         merged.each { vuln ->
                             def sev = (vuln.severity ?: '').toUpperCase()
-                            if (sev == 'HIGH')     mergedHighCount++
                             if (sev == 'CRITICAL') mergedCritCount++
+                            if (sev == 'HIGH')     mergedHighCount++
+                            if (sev == 'MEDIUM')   mergedMedCount++
+                            if (sev == 'LOW')      mergedLowCount++
                         }
                     } else {
                         ["${WORKSPACE}/output/trivy-result.json",
@@ -838,8 +860,11 @@ print("[저장] " + OUTPUT_FILE)
                                 def json = readJSON file: filePath
                                 json.Results?.each { result ->
                                     result.Vulnerabilities?.each { vuln ->
-                                        if (vuln.Severity == 'HIGH')     mergedHighCount++
-                                        if (vuln.Severity == 'CRITICAL') mergedCritCount++
+                                        def sev = (vuln.Severity ?: '').toUpperCase()
+                                        if (sev == 'CRITICAL') mergedCritCount++
+                                        if (sev == 'HIGH')     mergedHighCount++
+                                        if (sev == 'MEDIUM')   mergedMedCount++
+                                        if (sev == 'LOW')      mergedLowCount++
                                     }
                                 }
                             }
@@ -868,15 +893,55 @@ print("[저장] " + OUTPUT_FILE)
                         }
                     }
 
-                    def totalVulns    = mergedHighCount + mergedCritCount
+                    // ── 비율 기반 점수 ──────────────────────────────────────
+                    // MEDIUM, LOW까지 포함한 전체를 분모로 사용 (100% 포화 방지)
+                    def totalVulns    = mergedCritCount + mergedHighCount + mergedMedCount + mergedLowCount
                     def criticalRatio = totalVulns > 0 ? (mergedCritCount / totalVulns as double) : 0.0
                     def highRatio     = totalVulns > 0 ? (mergedHighCount  / totalVulns as double) : 0.0
-                    def baseScore     = (criticalRatio * 100) + (highRatio * 40) + (semgrepCount * 0.2)
-                    def baseScoreStr  = String.format('%.1f', baseScore)
-                    def maxScoreStr   = String.format('%.2f', maxFinalScore)
+                    def ratioScore    = (criticalRatio * 100) + (highRatio * 40) + (semgrepCount * 0.2)
 
-                    def critPctStr = String.format('%.1f', criticalRatio * 100)
-                    def highPctStr = String.format('%.1f', highRatio * 100)
+                    // ── 절댓값 하한선 ───────────────────────────────────────
+                    // 비율이 낮아도 절대 개수가 많으면 별도 판정
+                    // ※ 첫 스캔 결과 보고 프로젝트 규모에 맞게 조정 권장
+                    def CRIT_HARD_BLOCK = 30   // CRITICAL 30개 이상 → 무조건 차단
+                    def CRIT_HARD_WARN  = 10   // CRITICAL 10개 이상 → 경고
+                    def HIGH_HARD_BLOCK = 100  // HIGH 100개 이상 → 무조건 차단
+                    def HIGH_HARD_WARN  = 50   // HIGH 50개 이상 → 경고
+
+                    def hardBlock = (mergedCritCount >= CRIT_HARD_BLOCK) || (mergedHighCount >= HIGH_HARD_BLOCK)
+                    def hardWarn  = (mergedCritCount >= CRIT_HARD_WARN)  || (mergedHighCount >= HIGH_HARD_WARN)
+
+                    // ── 최종 판정 (비율 OR 절댓값 중 높은 쪽 적용) ──────────
+                    def finalGate       = 'PASS'
+                    def finalGateReason = ''
+
+                    if (blockCount > 0) {
+                        finalGate = 'BLOCK'
+                        finalGateReason = "비즈니스 차단 취약점 ${blockCount}건 (14점↑/20점)"
+                    }
+                    if (hardBlock) {
+                        finalGate = 'BLOCK'
+                        finalGateReason = finalGateReason
+                            ? finalGateReason + " + 절댓값 초과(CRIT=${mergedCritCount}≥${CRIT_HARD_BLOCK} or HIGH=${mergedHighCount}≥${HIGH_HARD_BLOCK})"
+                            : "절댓값 하한 초과 (CRIT=${mergedCritCount}≥${CRIT_HARD_BLOCK} or HIGH=${mergedHighCount}≥${HIGH_HARD_BLOCK})"
+                    }
+                    if (ratioScore >= 50.0) {
+                        finalGate = 'BLOCK'
+                        finalGateReason = finalGateReason
+                            ? finalGateReason + " + 비율점수 ${String.format('%.1f', ratioScore)}점≥50점"
+                            : "비율 점수 초과 (${String.format('%.1f', ratioScore)}점 ≥ 50점)"
+                    }
+                    if (finalGate != 'BLOCK') {
+                        if (hardWarn || (ratioScore >= 30.0) || (warnCount > 0)) {
+                            finalGate = 'WARN'
+                            def warnReasons = []
+                            if (ratioScore >= 30.0) warnReasons.add("비율점수 ${String.format('%.1f', ratioScore)}점≥30점")
+                            if (mergedCritCount >= CRIT_HARD_WARN) warnReasons.add("CRIT=${mergedCritCount}≥${CRIT_HARD_WARN}")
+                            if (mergedHighCount >= HIGH_HARD_WARN) warnReasons.add("HIGH=${mergedHighCount}≥${HIGH_HARD_WARN}")
+                            if (warnCount > 0) warnReasons.add("비즈니스 경고 취약점 ${warnCount}건")
+                            finalGateReason = warnReasons.join(" + ")
+                        }
+                    }
 
                     def swaggerHighRisk = 0
                     if (fileExists("${WORKSPACE}/output/swagger-analysis.json")) {
@@ -884,37 +949,46 @@ print("[저장] " + OUTPUT_FILE)
                         swaggerHighRisk = swaggerJson.summary?.high_risk?.size() ?: 0
                     }
 
-                    def baseGate = baseScore >= 50.0 ? '🔴 차단' :
-                                   baseScore >= 30.0 ? '🟠 경고' : '🟢 정상'
-
                     echo """
-                    ======================================================
-                    Semgrep 발견              : ${semgrepCount}건
-                    병합 총 취약점            : ${totalVulns}건
-                      ├ CRITICAL             : ${mergedCritCount}건 (${critPctStr}%)
-                      └ HIGH                 : ${mergedHighCount}건 (${highPctStr}%)
-                    npm audit HIGH           : ${npmHighCount}건
-                    npm audit CRITICAL       : ${npmCritCount}건
-                    Swagger 고위험 Endpoint  : ${swaggerHighRisk}개 (score>=5)
-                    ---------------------------
-                    기본 리스크 점수         : ${baseScoreStr}점 ${baseGate}
-                    비즈니스 최고 점수       : ${maxScoreStr}/20점
-                    🔴 차단(Block) 14점 이상 : ${blockCount}건
-                    🟠 경고(Warn)  8~13점    : ${warnCount}건
-                    ======================================================
+======================================================
+  Semgrep 발견              : ${semgrepCount}건
+  전체 취약점               : ${totalVulns}건
+    ├ CRITICAL             : ${mergedCritCount}건 (${String.format('%.1f', criticalRatio * 100)}%)
+    ├ HIGH                 : ${mergedHighCount}건 (${String.format('%.1f', highRatio * 100)}%)
+    ├ MEDIUM               : ${mergedMedCount}건
+    └ LOW                  : ${mergedLowCount}건
+  npm audit HIGH           : ${npmHighCount}건
+  npm audit CRITICAL       : ${npmCritCount}건
+  Swagger 고위험 Endpoint  : ${swaggerHighRisk}개 (score>=5)
+------------------------------------------------------
+  [비율 기반 점수]          : ${String.format('%.1f', ratioScore)}점
+    CRITICAL비율×100       = ${String.format('%.1f', criticalRatio * 100)}점
+    HIGH비율×40            = ${String.format('%.1f', highRatio * 40)}점
+    Semgrep×0.2            = ${String.format('%.1f', semgrepCount * 0.2)}점
+    임계값: 차단 50점↑ / 경고 30점↑
+------------------------------------------------------
+  [절댓값 하한선]
+    CRITICAL ${mergedCritCount}개  (차단≥${CRIT_HARD_BLOCK} / 경고≥${CRIT_HARD_WARN})  ${mergedCritCount >= CRIT_HARD_BLOCK ? '🔴 차단' : mergedCritCount >= CRIT_HARD_WARN ? '🟠 경고' : '🟢 통과'}
+    HIGH     ${mergedHighCount}개  (차단≥${HIGH_HARD_BLOCK} / 경고≥${HIGH_HARD_WARN})  ${mergedHighCount >= HIGH_HARD_BLOCK ? '🔴 차단' : mergedHighCount >= HIGH_HARD_WARN ? '🟠 경고' : '🟢 통과'}
+------------------------------------------------------
+  [비즈니스 점수]
+    최고 점수              : ${String.format('%.2f', maxFinalScore)}/20점
+    🔴 차단(Block) 14점↑  : ${blockCount}건
+    🟠 경고(Warn)  8~13점 : ${warnCount}건
+------------------------------------------------------
+  ★ 최종 판정 : ${finalGate == 'BLOCK' ? '🔴 차단(BLOCK)' : finalGate == 'WARN' ? '🟠 경고(WARN)' : '🟢 정상(PASS)'}
+    사유: ${finalGateReason ?: '이상 없음'}
+======================================================
                     """
 
-                    if (blockCount > 0) {
-                        unstable("🚨 비즈니스 차단(Block) 취약점 ${blockCount}건 발견!")
+                    if (finalGate == 'BLOCK') {
+                        unstable("🚨 ${finalGateReason}")
                         currentBuild.result = 'FAILURE'
-                    } else if (baseScore >= 50.0) {
-                        unstable("🚨 기본 리스크 점수 ${baseScoreStr}점 ≥ 임계값 50점!")
-                        currentBuild.result = 'FAILURE'
-                    } else if (baseScore >= 30.0) {
-                        echo "⚠️ 기본 리스크 점수 ${baseScoreStr}점 — 경고 구간"
+                    } else if (finalGate == 'WARN') {
+                        echo "⚠️ 경고 구간 — 배포 주의"
                         currentBuild.result = 'UNSTABLE'
                     } else {
-                        echo "✅ 리스크 점수 통과 (${baseScoreStr}점)"
+                        echo "✅ 리스크 점수 통과"
                     }
                 }
             }
@@ -955,14 +1029,14 @@ print("[저장] " + OUTPUT_FILE)
 
                     // ── Semgrep 공격 표면 유형별 집계 ──────────────────────
                     def attackSurface = [
-                        'sql-injection'     : 0,
-                        'xss'               : 0,
-                        'path-traversal'    : 0,
-                        'open-redirect'     : 0,
-                        'code-injection'    : 0,
-                        'hardcoded-secret'  : 0,
-                        'directory-listing' : 0,
-                        'other'             : 0
+                        'sql-injection'    : 0,
+                        'xss'              : 0,
+                        'path-traversal'   : 0,
+                        'open-redirect'    : 0,
+                        'code-injection'   : 0,
+                        'hardcoded-secret' : 0,
+                        'directory-listing': 0,
+                        'other'            : 0
                     ]
 
                     semgrepJson.results?.each { finding ->
@@ -1006,7 +1080,6 @@ print("[저장] " + OUTPUT_FILE)
                     def changeMed  = medCount  - prevMed
                     def changeLow  = lowCount  - prevLow
 
-                    // 현재 값 저장 (다음 빌드에서 이전값으로 사용)
                     writeJSON file: prevMetricFile, json: [
                         critCount: critCount,
                         highCount: highCount,
@@ -1015,7 +1088,7 @@ print("[저장] " + OUTPUT_FILE)
                     ]
 
                     def semgrepCount = semgrepJson.results?.size() ?: 0
-                    def totalVulns   = critCount + highCount
+                    def totalVulns   = critCount + highCount + medCount + lowCount
                     def critRatio    = totalVulns > 0 ? (critCount / totalVulns as double) : 0.0
                     def highRatio    = totalVulns > 0 ? (highCount  / totalVulns as double) : 0.0
                     def baseScore    = (critRatio * 100) + (highRatio * 40) + (semgrepCount * 0.2)
@@ -1077,14 +1150,12 @@ trivy_pipe_attack_surface{type="other"} ${attackSurface['other']}
                     writeFile file: "${WORKSPACE}/output/metrics.txt", text: metrics
 
                     sh """
-                        # Pushgateway 전송
                         curl -s -X POST \\
                             http://pushgateway:9091/metrics/job/trivy-pipe/instance/juice-shop \\
                             --data-binary @${WORKSPACE}/output/metrics.txt \\
                         && echo "✅ Prometheus Push 완료" \\
                         || echo "⚠️ Prometheus Push 실패"
 
-                        # node_exporter textfile collector용 복사
                         mkdir -p /var/jenkins_home/metrics
                         cp ${WORKSPACE}/output/metrics.txt /var/jenkins_home/metrics/trivy_pipe.prom
                         echo "✅ textfile 복사 완료"
@@ -1124,7 +1195,7 @@ trivy_pipe_attack_surface{type="other"} ${attackSurface['other']}
             }
         }
 
-    }
+    } // stages 끝
 
     post {
         always {
