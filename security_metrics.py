@@ -2,9 +2,12 @@
 security_metrics.py
 
 Jenkins stage 10에서 실행되는 보안 결과 집계 + Prometheus Pushgateway 전송 스크립트.
-추가된 메트릭:
-  - attack_surface_count{type}       : Semgrep 공격 표면 유형별
-  - vuln_change_count{severity}      : 이전 빌드 대비 취약점 변화율
+
+[변경 이력]
+  - calc_risk_score: 가중합 기반 → 비율 기반으로 변경
+    기존: weighted_sum / MAX_RAW(450) 방식 → 293개 취약점 기준 항상 100점 포화
+    변경: (CRITICAL비율×100 + HIGH비율×40 + Semgrep×0.2) / 150 × 100
+          Stage 8 Risk Scoring & Gate 와 동일한 계산 방식으로 일관성 확보
 """
 
 import json
@@ -334,32 +337,52 @@ def aggregate(all_vulns: list) -> dict:
 
 
 # =============================================================================
-# 보안 점수 모델링
+# 보안 점수 모델링 (비율 기반 — Stage 8 Risk Scoring & Gate 와 동일)
+#
+# 계산식:
+#   crit_ratio  = CRITICAL수 / 전체수 (CRITICAL+HIGH+MEDIUM+LOW 분모)
+#   high_ratio  = HIGH수     / 전체수
+#   ratio_score = (crit_ratio × 100) + (high_ratio × 40) + (semgrep수 × 0.2)
+#   risk_score  = min(ratio_score / 150 × 100, 100)
+#
+# MAX_RAW = 150 근거:
+#   최악의 경우 crit_ratio=100% → 100점
+#             + high_ratio=0%  →   0점
+#             + semgrep 250건  →  50점  합계 150점
 # =============================================================================
 
 def calc_risk_score(agg: dict, semgrep_count: int) -> dict:
     by_sev = agg["by_severity"]
-    total  = agg["total"]
 
     c = by_sev.get("CRITICAL", 0)
     h = by_sev.get("HIGH",     0)
     m = by_sev.get("MEDIUM",   0)
     l = by_sev.get("LOW",      0)
 
-    weighted_sum    = c * 5 + h * 3 + m * 2 + l * 1
-    critical_ratio  = (c / total) if total > 0 else 0.0
-    critical_bonus  = critical_ratio * weighted_sum * 0.5
-    semgrep_penalty = semgrep_count * 0.2
+    # 전체를 분모로 → CRITICAL+HIGH만 쓸 때 항상 100% 되는 문제 방지
+    total = c + h + m + l
+    crit_ratio = (c / total) if total > 0 else 0.0
+    high_ratio = (h / total) if total > 0 else 0.0
 
-    raw_score  = weighted_sum + critical_bonus + semgrep_penalty
-    MAX_RAW    = 450.0
+    crit_score    = crit_ratio * 100
+    high_score    = high_ratio * 40
+    semgrep_score = semgrep_count * 0.2
+
+    raw_score  = crit_score + high_score + semgrep_score
+    MAX_RAW    = 150.0
     risk_score = min(raw_score / MAX_RAW * 100.0, 100.0)
 
+    log.info("[Risk Score 상세]")
+    log.info("  CRITICAL비율 " + str(round(crit_ratio * 100, 1)) + "% × 100 = " + str(round(crit_score, 2)) + "점")
+    log.info("  HIGH비율     " + str(round(high_ratio * 100, 1)) + "% × 40  = " + str(round(high_score, 2)) + "점")
+    log.info("  Semgrep      " + str(semgrep_count) + "건 × 0.2  = " + str(round(semgrep_score, 2)) + "점")
+    log.info("  raw=" + str(round(raw_score, 2)) + " / MAX_RAW=" + str(MAX_RAW) + " → " + str(round(risk_score, 2)) + "/100점")
+
     return {
-        "risk_score"      : round(risk_score, 2),
-        "critical_score"  : round(c * 5 + critical_bonus, 2),
-        "high_score"      : round(h * 3, 2),
-        "semgrep_score"   : round(semgrep_penalty, 2),
+        "risk_score"    : round(risk_score, 2),
+        "critical_score": round(crit_score, 2),
+        "high_score"    : round(high_score, 2),
+        "semgrep_score" : round(semgrep_score, 2),
     }
 
 
@@ -420,8 +443,8 @@ def push_metrics(agg: dict, risk: dict, confidence: dict,
     # ── package_risk_score{package, cve} — Top 10 ─────────────────────────
     g_pkg = Gauge("package_risk_score", "패키지별 위험 점수 (Top 10)", ["package", "cve"], registry=registry)
     for item in top10:
-        pkg_raw = item["package"][:60]
-        cve_raw = item["cve"][:60] if item["cve"] else "N/A"
+        pkg_raw   = item["package"][:60]
+        cve_raw   = item["cve"][:60] if item["cve"] else "N/A"
         pkg_label = re.sub(r'[^a-zA-Z0-9_.:\-]', '_', pkg_raw)
         cve_label = re.sub(r'[^a-zA-Z0-9_.:\-]', '_', cve_raw)
         if not pkg_label:
@@ -435,12 +458,12 @@ def push_metrics(agg: dict, risk: dict, confidence: dict,
     for level in ["single", "double", "triple"]:
         g_conf.labels(confidence=level).set(confidence[level])
 
-    # ── attack_surface_count{type} — 공격 표면 유형별 ────────────────────
+    # ── attack_surface_count{type} ────────────────────────────────────────
     g_attack = Gauge("attack_surface_count", "Semgrep 공격 표면 유형별 취약점 수", ["type"], registry=registry)
     for attack_type, count in attack_surface.items():
         g_attack.labels(type=attack_type).set(count)
 
-    # ── vuln_change_count{severity} — 이전 빌드 대비 변화율 ──────────────
+    # ── vuln_change_count{severity} ───────────────────────────────────────
     g_change = Gauge("vuln_change_count", "이전 빌드 대비 취약점 변화 수 (양수=증가, 음수=감소)", ["severity"], registry=registry)
     for sev, change in vuln_change.items():
         g_change.labels(severity=sev.lower()).set(change)
@@ -501,19 +524,21 @@ def main():
 
     log.info("[Confidence] " + str(confidence))
 
-    # 공격 표면 분석
     attack_surface = parse_attack_surface()
+    vuln_change    = calc_vuln_change(agg["by_severity"])
 
-    # 이전 빌드 대비 변화율
-    vuln_change = calc_vuln_change(agg["by_severity"])
-
+    # build_status: risk_score 70점 이상 또는 CRITICAL 존재 시 FAIL
     crit_count   = agg["by_severity"].get("CRITICAL", 0)
     build_status = 0 if (risk["risk_score"] >= 70.0 or crit_count > 0) else 1
     log.info("[Build Status] " + ("PASS" if build_status == 1 else "FAIL"))
 
     log.info("[Top 10 패키지]")
     for i, item in enumerate(agg["top10_packages"], 1):
-        log.info("  " + str(i).rjust(2) + ". " + item['package'] + " | " + item['cve'] + " | " + item['severity'] + " | score=" + str(round(item['score'], 1)))
+        log.info(
+            "  " + str(i).rjust(2) + ". " +
+            item['package'] + " | " + item['cve'] + " | " +
+            item['severity'] + " | score=" + str(round(item['score'], 1))
+        )
 
     push_metrics(
         agg=agg,
