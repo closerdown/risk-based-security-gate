@@ -904,9 +904,13 @@ print("[저장] " + OUTPUT_FILE)
                     def qualityScore = Math.min((top3Avg / 20.0) * 70.0 as double, 70.0 as double)
 
                     // 규모점수: 취약점 개수 + 고위험 Endpoint
-                    def swaggerHighRisk2 = swaggerHighRisk as double
+                    def swaggerHighRiskCount = 0 as double
+                    if (fileExists("${WORKSPACE}/output/swagger-analysis.json")) {
+                        def swaggerJsonTmp = readJSON file: "${WORKSPACE}/output/swagger-analysis.json"
+                        swaggerHighRiskCount = (swaggerJsonTmp.summary?.high_risk?.size() ?: 0) as double
+                    }
                     def vulnScale    = ((mergedCritCount * 1.0) + (mergedHighCount * 0.2) + (mergedMedCount * 0.05)) as double
-                    def endpointScale = (swaggerHighRisk2 * 0.3) as double
+                    def endpointScale = (swaggerHighRiskCount * 0.3) as double
                     def scaleScore   = Math.min((vulnScale + endpointScale) as double, 30.0 as double)
 
                     def ratioScore   = Math.min((qualityScore + scaleScore) as double, 100.0 as double)
@@ -970,11 +974,7 @@ print("[저장] " + OUTPUT_FILE)
                         }
                     }
 
-                    def swaggerHighRisk = 0
-                    if (fileExists("${WORKSPACE}/output/swagger-analysis.json")) {
-                        def swaggerJson = readJSON file: "${WORKSPACE}/output/swagger-analysis.json"
-                        swaggerHighRisk = swaggerJson.summary?.high_risk?.size() ?: 0
-                    }
+                    def swaggerHighRisk = swaggerHighRiskCount as int
 
                     echo """
 ======================================================
