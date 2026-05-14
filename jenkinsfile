@@ -900,16 +900,16 @@ print("[저장] " + OUTPUT_FILE)
                         def sorted = bizAll.collect { (it.finalScore ?: 0.0) as double }.sort().reverse()
                         top3Scores = sorted.size() >= 3 ? sorted[0..2] : sorted
                     }
-                    def top3Avg      = top3Scores ? top3Scores.sum() / top3Scores.size() : 0.0
-                    def qualityScore = Math.min((top3Avg / 20.0) * 70.0, 70.0)
+                    def top3Avg      = top3Scores ? (top3Scores.sum() / top3Scores.size()) as double : 0.0 as double
+                    def qualityScore = Math.min((top3Avg / 20.0) * 70.0 as double, 70.0 as double)
 
                     // 규모점수: 취약점 개수 + 고위험 Endpoint
                     def swaggerHighRisk2 = swaggerHighRisk as double
-                    def vulnScale    = (mergedCritCount * 1.0) + (mergedHighCount * 0.2) + (mergedMedCount * 0.05)
-                    def endpointScale = swaggerHighRisk2 * 0.3
-                    def scaleScore   = Math.min(vulnScale + endpointScale, 30.0)
+                    def vulnScale    = ((mergedCritCount * 1.0) + (mergedHighCount * 0.2) + (mergedMedCount * 0.05)) as double
+                    def endpointScale = (swaggerHighRisk2 * 0.3) as double
+                    def scaleScore   = Math.min((vulnScale + endpointScale) as double, 30.0 as double)
 
-                    def ratioScore   = Math.min(qualityScore + scaleScore, 100.0)
+                    def ratioScore   = Math.min((qualityScore + scaleScore) as double, 100.0 as double)
 
                     // ── 임계값 (실제 juice-shop 수치 기반으로 설정) ────────
                     // 현재 수치: 비율점수=47.7 / CRITICAL=16 / HIGH=81 / warnCount=5
@@ -1118,9 +1118,9 @@ print("[저장] " + OUTPUT_FILE)
                     def highRatio    = totalVulns > 0 ? (highCount  / totalVulns as double) : 0.0
                     // 절대 개수 기반 (security_metrics.py, Stage 8과 동일)
                     def baseScore    = Math.min(
-                        (critCount * 3.0) + (highCount * 0.5) +
-                        (medCount  * 0.1) + (semgrepCount * 0.3),
-                        100.0
+                        ((critCount * 3.0) + (highCount * 0.5) +
+                        (medCount  * 0.1) + (semgrepCount * 0.3)) as double,
+                        100.0 as double
                     )
                     def buildNum     = env.BUILD_NUMBER ?: '0'
 
