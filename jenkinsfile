@@ -907,12 +907,12 @@ print("[저장] " + OUTPUT_FILE)
                     //   CRITICAL ≥ 40개
                     //   HIGH     ≥ 150개
                     //   blockCount > 0
-                    def CRIT_HARD_BLOCK = 40
-                    def CRIT_HARD_WARN  = 15
-                    def HIGH_HARD_BLOCK = 150
-                    def HIGH_HARD_WARN  = 75
-                    def RATIO_BLOCK     = 70.0
-                    def RATIO_WARN      = 40.0
+                    def CRIT_HARD_BLOCK = 10    // CRITICAL 10개↑ → BLOCK
+                    def CRIT_HARD_WARN  = 5     // CRITICAL 5개↑  → WARN
+                    def HIGH_HARD_BLOCK = 70    // HIGH 70개↑     → BLOCK
+                    def HIGH_HARD_WARN  = 30    // HIGH 30개↑     → WARN
+                    def RATIO_BLOCK     = 40.0  // 비율점수 40점↑  → BLOCK
+                    def RATIO_WARN      = 20.0  // 비율점수 20점↑  → WARN
 
                     def hardBlock = (mergedCritCount >= CRIT_HARD_BLOCK) || (mergedHighCount >= HIGH_HARD_BLOCK)
                     def hardWarn  = (mergedCritCount >= CRIT_HARD_WARN)  || (mergedHighCount >= HIGH_HARD_WARN)
