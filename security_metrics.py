@@ -472,7 +472,8 @@ def calc_confidence(merged: list) -> dict:
 
 def push_metrics(agg: dict, risk: dict, confidence: dict,
                  top10: list, build_status: int,
-                 attack_surface: dict, vuln_change: dict):
+                 attack_surface: dict, vuln_change: dict,
+                 total_raw: int = 0):
     registry = CollectorRegistry()
 
     g_risk = Gauge("supplychain_risk_score", "공급망 보안 위험 점수 (0~100점)", registry=registry)
@@ -481,8 +482,8 @@ def push_metrics(agg: dict, risk: dict, confidence: dict,
     g_build = Gauge("build_status", "빌드 결과 (1=성공, 0=실패)", registry=registry)
     g_build.set(build_status)
 
-    g_total = Gauge("total_vulnerability_count", "전체 취약점 수", registry=registry)
-    g_total.set(agg["total"])
+    g_total = Gauge("total_vulnerability_count", "전체 취약점 수 (중복 포함)", registry=registry)
+    g_total.set(total_raw if total_raw > 0 else agg["total"])
 
     g_sev = Gauge("vulnerability_count", "severity별 취약점 수", ["severity"], registry=registry)
     for sev in SEV_LIST:
@@ -639,7 +640,8 @@ def main():
         top10=agg["top10_packages"],
         build_status=build_status,
         attack_surface=attack_surface,
-        vuln_change=vuln_change
+        vuln_change=vuln_change,
+        total_raw=agg_all["total"]   # 293개 (중복 포함 전체 탐지 수)
     )
 
     log.info("=" * 60)
