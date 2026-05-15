@@ -219,10 +219,14 @@ def parse_trivy(paths):
                 vid = v.get("VulnerabilityID")
                 if not vid:
                     continue
-                cvss = 0.0
+                cvss = None
                 for src in (v.get("CVSS") or {}).values():
-                    cvss = max(cvss, float(src.get("V3Score") or src.get("V2Score") or 0))
-                if vid not in vulns or cvss > vulns[vid]["cvss"]:
+                    val = float(src.get("V3Score") or src.get("V2Score") or 0)
+                    if val > 0:
+                        cvss = max(cvss, val) if cvss is not None else val
+                prev = vulns.get(vid)
+                is_better = (prev is None) or (cvss is not None and (prev["cvss"] is None or cvss > prev["cvss"]))
+                if is_better:
                     vulns[vid] = {
                         "vuln_id" : vid,
                         "package" : v.get("PkgName", ""),
@@ -254,14 +258,17 @@ def parse_owasp(path):
             if not (vid.startswith("CVE-") or vid.startswith("GHSA-")):
                 continue
             try:
-                cvss = float(
+                raw_cvss = float(
                     vuln.findtext(tag("cvssV3")) or
                     vuln.findtext(tag("cvssScore")) or 0
                 )
+                cvss = raw_cvss if raw_cvss > 0 else None
             except ValueError:
-                cvss = 0.0
+                cvss = None
             sev = norm_sev(vuln.findtext(tag("severity")) or "")
-            if vid not in vulns or cvss > vulns[vid]["cvss"]:
+            prev = vulns.get(vid)
+            is_better = (prev is None) or (cvss is not None and (prev["cvss"] is None or cvss > prev["cvss"]))
+            if is_better:
                 vulns[vid] = {
                     "vuln_id" : vid,
                     "package" : pkg,
@@ -298,10 +305,11 @@ def parse_npm(paths):
                     else:
                         continue
                 cvss_info = via.get("cvss") or {}
-                cvss = float(cvss_info.get("score") or 0)
-                if cvss == 0.0:
-                    cvss = {"CRITICAL": 9.0, "HIGH": 7.5, "MEDIUM": 5.0, "LOW": 2.0}.get(sev, 0.0)
-                if vid not in vulns or cvss > vulns[vid]["cvss"]:
+                raw_score = float(cvss_info.get("score") or 0)
+                cvss = raw_score if raw_score > 0 else None
+                prev = vulns.get(vid)
+                is_better = (prev is None) or (cvss is not None and (prev["cvss"] is None or cvss > prev["cvss"]))
+                if is_better:
                     vulns[vid] = {
                         "vuln_id" : vid,
                         "package" : pkg_name,
@@ -327,17 +335,19 @@ def merge(trivy, owasp, npm):
             if entry is None:
                 entry = npm[vid].copy()
             else:
-                entry["cvss"] = max(entry["cvss"], npm[vid]["cvss"])
+                a, b = entry["cvss"], npm[vid]["cvss"]
+                entry["cvss"] = max(a, b) if a is not None and b is not None else (a if a is not None else b)
         if vid in owasp:
             sources.append("owasp")
             if entry is None:
                 entry = owasp[vid].copy()
             else:
-                entry["cvss"] = max(entry["cvss"], owasp[vid]["cvss"])
+                a, b = entry["cvss"], owasp[vid]["cvss"]
+                entry["cvss"] = max(a, b) if a is not None and b is not None else (a if a is not None else b)
         entry["source"]       = "+".join(sources)
         entry["source_count"] = len(sources)
         merged.append(entry)
-    merged.sort(key=lambda x: x["cvss"], reverse=True)
+    merged.sort(key=lambda x: x["cvss"] if x["cvss"] is not None else -1, reverse=True)
     return merged
 
 trivy  = parse_trivy(TRIVY_FILES)
