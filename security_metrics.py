@@ -508,17 +508,20 @@ def push_metrics(agg: dict, risk: dict, confidence: dict,
     g_raw.labels(type="semgrep").set(agg["by_tool"].get("semgrep", 0))
     g_raw.labels(type="endpoint_high_risk").set(swagger_high_risk)
 
-    g_pkg = Gauge("package_risk_score", "패키지별 위험 점수 (Top 10)", ["package", "cve"], registry=registry)
+    # severity 라벨 추가 → Grafana 필터링 가능
+    g_pkg = Gauge("package_risk_score", "패키지별 위험 점수 (전체)", ["package", "cve", "severity"], registry=registry)
     for item in top10:
         pkg_raw   = item["package"][:60]
         cve_raw   = item["cve"][:60] if item["cve"] else "N/A"
+        sev_raw   = item.get("severity", "UNKNOWN").upper()
         pkg_label = re.sub(r'[^a-zA-Z0-9_.:\-]', '_', pkg_raw)
         cve_label = re.sub(r'[^a-zA-Z0-9_.:\-]', '_', cve_raw)
+        sev_label = sev_raw if sev_raw in ["CRITICAL", "HIGH", "MEDIUM", "LOW"] else "UNKNOWN"
         if not pkg_label:
             pkg_label = "unknown"
         if not cve_label:
             cve_label = "N/A"
-        g_pkg.labels(package=pkg_label, cve=cve_label).set(item["score"])
+        g_pkg.labels(package=pkg_label, cve=cve_label, severity=sev_label).set(item["score"])
 
     g_conf = Gauge("vulnerability_confidence_count", "탐지 신뢰도별 취약점 수", ["confidence"], registry=registry)
     for level in ["single", "double", "triple"]:
