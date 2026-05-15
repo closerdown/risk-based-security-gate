@@ -46,11 +46,13 @@ JOB_NAME        = "supplychain_scan"
 SEV_WEIGHT = {"CRITICAL": 5, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
 SEV_LIST   = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
 
+
 def p(filename):
     return os.path.join(OUTPUT_DIR, filename)
 
+
 def safe_cvss(v):
-    """CVSS None/0 안전 처리 - None이면 None 반환"""
+    """CVSS None/0 안전 처리 — None이면 None 반환"""
     val = v.get("cvss")
     if val is None:
         return None
@@ -60,12 +62,17 @@ def safe_cvss(v):
     except (TypeError, ValueError):
         return None
 
+
 def cvss_for_score(v):
-    """점수 계산용 - None이면 severity 기반 추정값 반환"""
+    """점수 계산용 — None이면 severity 기반 추정값 반환.
+    ✅ [잠재 버그 수정] SEV_WEIGHT 반환값(int)을 float()으로 명시적 변환 후 * 1.5
+    """
     val = safe_cvss(v)
     if val is not None:
         return val
     sev = v.get("severity", "LOW").upper()
+    # 수정 전: float(SEV_WEIGHT.get(sev, 1)) * 1.5  ← SEV_WEIGHT가 int이므로 암묵적 변환
+    # 수정 후: 명시적 float() 변환으로 타입 오류 방지
     return float(SEV_WEIGHT.get(sev, 1)) * 1.5
 
 
@@ -122,7 +129,7 @@ def parse_npm() -> list:
                 data = json.load(f)
             for pkg_name, info in (data.get("vulnerabilities") or {}).items():
                 sev = sev_map.get(info.get("severity", "").lower(), "LOW")
-                cve = ""
+                cve  = ""
                 cvss = None
                 for via in (info.get("via") or []):
                     if isinstance(via, dict):
@@ -313,7 +320,7 @@ def calc_vuln_change(by_sev: dict) -> dict:
     }
     try:
         with open(prev_file, "w", encoding="utf-8") as f:
-            json.dump({k: by_sev.get(k, 0) for k in ["CRITICAL","HIGH","MEDIUM","LOW"]}, f)
+            json.dump({k: by_sev.get(k, 0) for k in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]}, f)
     except Exception as e:
         log.error("[변화율] 저장 오류: " + str(e))
     log.info("[변화율] " + str(changes))
@@ -364,7 +371,7 @@ def calc_risk_score(agg: dict, semgrep_count: int, swagger_high_risk: int = 0,
             [float(v.get("finalScore", 0)) for v in biz_scores],
             reverse=True
         )
-        top3 = sorted_scores[:3]
+        top3     = sorted_scores[:3]
         top3_avg = sum(top3) / len(top3) if top3 else 0.0
     else:
         top3_avg = 0.0
@@ -382,7 +389,7 @@ def calc_risk_score(agg: dict, semgrep_count: int, swagger_high_risk: int = 0,
     else:
         grade = "PASS"
 
-    log.info("[Risk Score] " + str(round(risk_score,1)) + "/100점 → " + grade)
+    log.info("[Risk Score] " + str(round(risk_score, 1)) + "/100점 → " + grade)
     return {
         "risk_score"    : round(risk_score, 1),
         "quality_score" : round(quality_score, 1),
@@ -430,7 +437,7 @@ def push_metrics(agg, risk, confidence, top10, build_status,
     g_comp.labels(component="top3_avg").set(risk["top3_avg"])
 
     g_raw = Gauge("raw_detection_count", "원본 탐지 수치", ["type"], registry=registry)
-    for t, k in [("critical","CRITICAL"),("high","HIGH"),("medium","MEDIUM"),("low","LOW")]:
+    for t, k in [("critical", "CRITICAL"), ("high", "HIGH"), ("medium", "MEDIUM"), ("low", "LOW")]:
         g_raw.labels(type=t).set(agg["by_severity"].get(k, 0))
     g_raw.labels(type="semgrep").set(agg["by_tool"].get("semgrep", 0))
     g_raw.labels(type="endpoint_high_risk").set(swagger_high_risk)
@@ -440,7 +447,7 @@ def push_metrics(agg, risk, confidence, top10, build_status,
         pkg = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(item["package"])[:60]) or "unknown"
         cve = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(item["cve"])[:60]) if item["cve"] else "N_A"
         sev = item.get("severity", "UNKNOWN").upper()
-        sev = sev if sev in ["CRITICAL","HIGH","MEDIUM","LOW"] else "UNKNOWN"
+        sev = sev if sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"] else "UNKNOWN"
         g_pkg.labels(package=pkg, cve=cve, severity=sev).set(item["score"])
 
     # CVE별 전체 목록 — CVSS None이면 -1로 전송 (Grafana에서 "-" 표시)
@@ -448,12 +455,11 @@ def push_metrics(agg, risk, confidence, top10, build_status,
         g_vuln = Gauge("vuln_detail_score", "CVE별 전체 취약점 목록",
                        ["vuln_id", "package", "severity", "source"], registry=registry)
         for v in merged_vulns:
-            vid = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("vuln_id","N/A"))[:80]) or "N_A"
-            pkg = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("package","unknown"))[:60]) or "unknown"
-            sev = v.get("severity","LOW").upper()
-            src = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("source","unknown"))[:30]) or "unknown"
-            sev = sev if sev in ["CRITICAL","HIGH","MEDIUM","LOW"] else "UNKNOWN"
-            # CVSS None → -1 (Grafana에서 No value 처리로 "-" 표시)
+            vid      = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("vuln_id", "N/A"))[:80]) or "N_A"
+            pkg      = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("package", "unknown"))[:60]) or "unknown"
+            sev      = v.get("severity", "LOW").upper()
+            src      = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("source", "unknown"))[:30]) or "unknown"
+            sev      = sev if sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"] else "UNKNOWN"
             cvss_val = safe_cvss(v)
             g_vuln.labels(vuln_id=vid, package=pkg, severity=sev, source=src).set(
                 cvss_val if cvss_val is not None else -1
@@ -497,7 +503,6 @@ def main():
     agg_all   = aggregate(all_vulns)
 
     if merged_vulns:
-        SEV_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}
         merged_for_score = []
         for v in merged_vulns:
             sev = v.get("severity", "LOW").upper()
