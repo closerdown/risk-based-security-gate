@@ -575,11 +575,28 @@ def main():
     # ── Risk Score / severity 수치는 merged_vulns 기준 (Stage 8과 동일)
     # merged_vulns = 중복 제거된 123개 고유 취약점
     if merged_vulns:
+        # severity 우선순위: 여러 도구가 다르게 잡으면 가장 높은 severity 사용
+        SEV_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}
+
+        def resolve_severity(v):
+            """merged_vuln의 severities 목록 중 가장 높은 것 반환"""
+            # merged_vulns.json에 severities 필드가 있으면 활용
+            severities = v.get("severities", [])
+            if severities:
+                ranked = sorted(
+                    [s.upper() for s in severities if s.upper() in SEV_RANK],
+                    key=lambda s: SEV_RANK.get(s, 0),
+                    reverse=True
+                )
+                return ranked[0] if ranked else v.get("severity", "LOW").upper()
+            # 없으면 단일 severity 사용
+            return v.get("severity", "LOW").upper()
+
         merged_for_score = [
             {
                 "tool"    : v.get("source", "merged"),
                 "cve"     : v.get("vuln_id", ""),
-                "severity": v.get("severity", "LOW").upper(),
+                "severity": resolve_severity(v),
                 "package" : v.get("package", "unknown"),
                 "cvss"    : float(v.get("cvss", 0))
             }
