@@ -473,7 +473,7 @@ def calc_confidence(merged: list) -> dict:
 def push_metrics(agg: dict, risk: dict, confidence: dict,
                  top10: list, build_status: int,
                  attack_surface: dict, vuln_change: dict,
-                 total_raw: int = 0):
+                 total_raw: int = 0, swagger_high_risk: int = 0):
     registry = CollectorRegistry()
 
     g_risk = Gauge("supplychain_risk_score", "공급망 보안 위험 점수 (0~100점)", registry=registry)
@@ -493,10 +493,20 @@ def push_metrics(agg: dict, risk: dict, confidence: dict,
     for tool in ["trivy", "npm", "owasp", "semgrep"]:
         g_tool.labels(tool=tool).set(agg["by_tool"].get(tool, 0))
 
+    # ── Risk Score 구성 요소 (품질/규모 기여도) ──────────────────────────────
     g_comp = Gauge("risk_component_score", "Risk Score 구성 요소별 기여도", ["component"], registry=registry)
-    g_comp.labels(component="critical").set(risk["critical_score"])
-    g_comp.labels(component="high").set(risk["high_score"])
-    g_comp.labels(component="semgrep").set(risk["semgrep_score"])
+    g_comp.labels(component="quality").set(risk["quality_score"])   # 품질점수 (비즈니스+CVSS)
+    g_comp.labels(component="scale").set(risk["scale_score"])       # 규모점수 (개수+Endpoint)
+    g_comp.labels(component="top3_avg").set(risk["top3_avg"])       # TOP3 비즈니스 평균
+
+    # ── 원본 수치 (탐지된 실제 개수) ────────────────────────────────────────
+    g_raw = Gauge("raw_detection_count", "원본 탐지 수치 (중복 제거 기준)", ["type"], registry=registry)
+    g_raw.labels(type="critical").set(agg["by_severity"].get("CRITICAL", 0))
+    g_raw.labels(type="high").set(agg["by_severity"].get("HIGH", 0))
+    g_raw.labels(type="medium").set(agg["by_severity"].get("MEDIUM", 0))
+    g_raw.labels(type="low").set(agg["by_severity"].get("LOW", 0))
+    g_raw.labels(type="semgrep").set(agg["by_tool"].get("semgrep", 0))
+    g_raw.labels(type="endpoint_high_risk").set(swagger_high_risk)
 
     g_pkg = Gauge("package_risk_score", "패키지별 위험 점수 (Top 10)", ["package", "cve"], registry=registry)
     for item in top10:
@@ -641,7 +651,8 @@ def main():
         build_status=build_status,
         attack_surface=attack_surface,
         vuln_change=vuln_change,
-        total_raw=agg_all["total"]   # 293개 (중복 포함 전체 탐지 수)
+        total_raw=agg_all["total"],        # 293개 (중복 포함 전체 탐지 수)
+        swagger_high_risk=swagger_high_risk  # 고위험 Endpoint 수
     )
 
     log.info("=" * 60)
