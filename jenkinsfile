@@ -136,7 +136,7 @@ pipeline {
                                         ${WORKSPACE}/src/frontend/dist/bom/bom.json || true
                                     echo "== SBOM 스캔 완료 =="
                                 else
-                                    echo "⚠️ bom.json 없음 — SBOM 스캔 스킵"
+                                    echo "bom.json 없음 -- SBOM 스캔 스킵"
                                 fi
 
                                 echo "== Trivy 전체 완료 =="
@@ -163,7 +163,7 @@ pipeline {
         }
 
         // =====================================================================
-        // stage 6.5 — Trivy + OWASP + npm audit CVE 병합 및 중복 제거
+        // stage 6.5 -- Trivy + OWASP + npm audit CVE 병합 및 중복 제거
         // =====================================================================
         stage('6.5. CVE Merge & Dedup') {
             steps {
@@ -174,7 +174,7 @@ pipeline {
                     def anyTrivy = fileExists("${WORKSPACE}/output/trivy-result.json") ||
                                    fileExists("${WORKSPACE}/output/trivy-frontend-result.json")
                     if (!anyTrivy) {
-                        echo "⚠️ Trivy 결과 파일 없음 — CVE 병합 스킵"
+                        echo "Trivy 결과 파일 없음 -- CVE 병합 스킵"
                         return
                     }
 
@@ -233,13 +233,13 @@ def parse_trivy(paths):
                         "cvss"    : cvss,
                         "source"  : "trivy"
                     }
-    print("[Trivy]     " + str(len(vulns)) + "개 (루트+frontend+node_modules+SBOM 합산)")
+    print("[Trivy]     " + str(len(vulns)) + "개")
     return vulns
 
 def parse_owasp(path):
     vulns = {}
     if not os.path.exists(path):
-        print("[OWASP]     파일 없음 — 스킵")
+        print("[OWASP]     파일 없음 -- 스킵")
         return vulns
     tree = ET.parse(path)
     root = tree.getroot()
@@ -248,7 +248,6 @@ def parse_owasp(path):
 
     for dep in root.iter(tag("dependency")):
         raw = dep.findtext(tag("fileName")) or ""
-        # ✅ [버그 수정] raw string r"..." 접두사 추가 — \. \d 등 이스케이프 정상화
         pkg = re.sub(r"\.(tgz|jar|zip|tar\.gz|war|ear)$", "", raw)
         pkg = re.sub(r"-[\d]+\.[\d].*$", "", pkg).lower().strip()
 
@@ -360,30 +359,29 @@ for v in merged:
         src_counter[s] += 1
 
 print("[병합 결과] 총 " + str(len(merged)) + "개 고유 취약점")
-print("  trivy 포함   : " + str(src_counter.get("trivy", 0)) + "개")
-print("  npm 포함     : " + str(src_counter.get("npm",   0)) + "개")
-print("  owasp 포함   : " + str(src_counter.get("owasp", 0)) + "개")
-print("  3개 모두     : " + str(sum(1 for v in merged if v["source_count"] == 3)) + "개")
-print("  2개 소스     : " + str(sum(1 for v in merged if v["source_count"] == 2)) + "개")
-print("  단독         : " + str(sum(1 for v in merged if v["source_count"] == 1)) + "개")
+print("  trivy  : " + str(src_counter.get("trivy", 0)) + "개")
+print("  npm    : " + str(src_counter.get("npm",   0)) + "개")
+print("  owasp  : " + str(src_counter.get("owasp", 0)) + "개")
+print("  3개 모두: " + str(sum(1 for v in merged if v["source_count"] == 3)) + "개")
+print("  2개 소스: " + str(sum(1 for v in merged if v["source_count"] == 2)) + "개")
+print("  단독    : " + str(sum(1 for v in merged if v["source_count"] == 1)) + "개")
 
 with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
     json.dump(merged, f, indent=2, ensure_ascii=False)
-print("[저장]      " + OUTPUT_FILE)
+print("[저장] " + OUTPUT_FILE)
 '''
                     sh "python3 ${WORKSPACE}/output/merge_vulns.py"
                 }
             }
             post {
                 failure {
-                    echo "❌ CVE 병합 실패 — 이전 stage 결과를 확인하세요."
+                    echo "CVE 병합 실패 -- 이전 stage 결과를 확인하세요."
                 }
             }
         }
 
         // =====================================================================
-        // stage 6.7 — Swagger(OpenAPI) 분석
-        // parse_swagger.py 는 리포지토리에 별도 파일로 관리
+        // stage 6.7 -- Swagger(OpenAPI) 분석
         // =====================================================================
         stage('6.7. Swagger Analysis') {
             steps {
@@ -394,10 +392,173 @@ print("[저장]      " + OUTPUT_FILE)
                         sh "rm -f ${outputFile}"
 
                         if (!fileExists(swaggerFile)) {
-                            echo "⚠️ swagger.yml 없음 — Swagger 분석 스킵"
+                            echo "swagger.yml 없음 -- Swagger 분석 스킵"
                             return
                         }
 
+                        // [버그 수정] re.findall 정규식에 raw string(r"") 접두사 추가
+                        // 일반 문자열에서 역슬래시 이스케이프가 잘못 해석되어 SyntaxError 발생했던 문제 수정
+                        writeFile file: "${WORKSPACE}/output/parse_swagger.py", text: '''
+import json, os, re, sys
+
+try:
+    import yaml
+except ImportError:
+    import subprocess
+    try:
+        subprocess.run(["apt-get", "install", "-y", "-q", "python3-yaml"],
+                       check=True, capture_output=True)
+    except Exception:
+        subprocess.run([sys.executable, "-m", "pip", "install", "pyyaml",
+                        "--break-system-packages", "-q"], check=True)
+    import yaml
+
+WS           = os.environ["WORKSPACE"]
+SWAGGER_FILE = WS + "/src/swagger.yml"
+OUTPUT_FILE  = WS + "/output/swagger-analysis.json"
+
+BIZ_CATEGORIES = [
+    {"name": "payment",   "score": 5, "keywords": ["pay", "payment", "checkout", "purchase",
+                                                     "billing", "charge", "refund", "transaction",
+                                                     "pg", "card", "bank", "stripe", "invoice"]},
+    {"name": "auth",      "score": 4, "keywords": ["auth", "login", "logout", "register", "signup",
+                                                     "password", "token", "oauth", "session",
+                                                     "credential", "jwt", "saml"]},
+    {"name": "admin",     "score": 4, "keywords": ["admin", "manager", "dashboard", "console",
+                                                     "superuser", "root", "config", "setting"]},
+    {"name": "inventory", "score": 4, "keywords": ["price", "stock", "inventory", "quantity",
+                                                     "discount", "product-edit"]},
+    {"name": "sandbox",   "score": 4, "keywords": ["vm", "sandbox", "eval", "execute", "template"]},
+    {"name": "personal",  "score": 3, "keywords": ["user", "profile", "personal", "privacy",
+                                                     "email", "phone", "address", "delivery",
+                                                     "shipping", "ssn", "kyc"]},
+    {"name": "coupon",    "score": 3, "keywords": ["coupon", "point", "voucher", "reward", "promo"]},
+    {"name": "security",  "score": 3, "keywords": ["sanitize", "xss", "escape", "helmet",
+                                                     "validator", "sql", "inject"]},
+    {"name": "product",   "score": 1, "keywords": ["product", "item", "catalog", "search",
+                                                     "list", "category"]},
+]
+
+PUBLIC_METHODS = {"get", "post", "put", "patch", "delete"}
+
+def get_biz_score(path_str):
+    p = path_str.lower()
+    for cat in BIZ_CATEGORIES:
+        for kw in cat["keywords"]:
+            if len(kw) >= 3 and kw in p:
+                return cat["score"], cat["name"], kw
+    return 0, "internal", ""
+
+with open(SWAGGER_FILE, encoding="utf-8") as f:
+    spec = yaml.safe_load(f)
+
+base_path = (spec.get("basePath") or "").rstrip("/")
+paths     = spec.get("paths") or {}
+
+endpoints = []
+summary   = {"total": 0, "by_category": {}, "by_method": {}, "high_risk": []}
+
+for path, path_item in paths.items():
+    if not isinstance(path_item, dict):
+        continue
+    for method, operation in path_item.items():
+        if method.lower() not in PUBLIC_METHODS:
+            continue
+        if not isinstance(operation, dict):
+            continue
+
+        full_path   = base_path + path
+        biz_score, biz_cat, matched_kw = get_biz_score(full_path)
+        is_public   = method.lower() in PUBLIC_METHODS
+        total_score = biz_score + (2 if is_public else 0)
+
+        entry = {
+            "path"         : full_path,
+            "method"       : method.upper(),
+            "summary"      : operation.get("summary", ""),
+            "tags"         : operation.get("tags", []),
+            "biz_category" : biz_cat,
+            "biz_score"    : biz_score,
+            "matched_kw"   : matched_kw,
+            "is_public"    : is_public,
+            "total_score"  : total_score,
+            "params"       : [p.get("name", "") for p in (operation.get("parameters") or [])],
+            "auth_required": "security" in operation or "security" in spec
+        }
+        endpoints.append(entry)
+
+        summary["total"] += 1
+        summary["by_category"][biz_cat] = summary["by_category"].get(biz_cat, 0) + 1
+        summary["by_method"][method.upper()] = summary["by_method"].get(method.upper(), 0) + 1
+        if total_score >= 5:
+            summary["high_risk"].append(full_path + " [" + method.upper() + "] score=" + str(total_score))
+
+SERVER_FILE = WS + "/src/server.ts"
+if os.path.exists(SERVER_FILE):
+    with open(SERVER_FILE, encoding="utf-8", errors="replace") as f:
+        content = f.read()
+
+    # raw string r"" 사용 -- 역슬래시가 정규식 특수문자로 올바르게 처리됨
+    patterns = re.findall(
+        r"app\.(get|post|put|patch|delete)\s*\(\s*[\'\""]([^\'\"]+)[\'\""]",
+        content
+    )
+
+    server_count = 0
+    for method, path in patterns:
+        already_exists = any(
+            ep["path"] == path and ep["method"] == method.upper()
+            for ep in endpoints
+        )
+        if already_exists:
+            continue
+
+        biz_score, biz_cat, matched_kw = get_biz_score(path)
+        is_public   = True
+        total_score = biz_score + 2
+
+        entry = {
+            "path"         : path,
+            "method"       : method.upper(),
+            "summary"      : "",
+            "tags"         : [],
+            "biz_category" : biz_cat,
+            "biz_score"    : biz_score,
+            "matched_kw"   : matched_kw,
+            "is_public"    : is_public,
+            "total_score"  : total_score,
+            "params"       : [],
+            "auth_required": False,
+            "source"       : "server.ts"
+        }
+        endpoints.append(entry)
+
+        summary["total"] += 1
+        summary["by_category"][biz_cat] = summary["by_category"].get(biz_cat, 0) + 1
+        summary["by_method"][method.upper()] = summary["by_method"].get(method.upper(), 0) + 1
+        if total_score >= 5:
+            summary["high_risk"].append(
+                path + " [" + method.upper() + "] score=" + str(total_score) + " (server.ts)"
+            )
+        server_count += 1
+    print("[server.ts] " + str(server_count) + "개 라우트 추가")
+
+endpoints.sort(key=lambda x: x["total_score"], reverse=True)
+
+result = {"endpoints": endpoints, "summary": summary}
+
+with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+    json.dump(result, f, indent=2, ensure_ascii=False)
+
+print("=== Swagger 분석 결과 ===")
+print("총 Endpoint  : " + str(summary["total"]) + "개")
+print("메서드 분포  : " + str(summary["by_method"]))
+print("카테고리 분포: " + str(summary["by_category"]))
+print("--- 고위험 Endpoint (score >= 5) ---")
+for ep in summary["high_risk"]:
+    print("  " + ep)
+print("[저장] " + OUTPUT_FILE)
+'''
                         sh "python3 ${WORKSPACE}/output/parse_swagger.py"
                     }
                 }
@@ -445,7 +606,6 @@ print("[저장]      " + OUTPUT_FILE)
                         def TRUST_WEIGHTS = [1.0, 1.0, 1.15, 1.30]
                         def MAX_RAW       = 96.0
 
-                        // ── Semgrep 결과 파싱 ──────────────────────────────
                         def publicRoutes    = []
                         def semgrepFindings = []
 
@@ -471,7 +631,6 @@ print("[저장]      " + OUTPUT_FILE)
                             echo "== Semgrep Route 패턴 ${publicRoutes.size()}개 식별 =="
                         }
 
-                        // ── Swagger 분석 결과 로드 ─────────────────────────
                         def swaggerEndpoints   = []
                         def swaggerPublicPaths = []
 
@@ -483,10 +642,9 @@ print("[저장]      " + OUTPUT_FILE)
                             }
                             echo "== Swagger Endpoint ${swaggerEndpoints.size()}개 로드 =="
                         } else {
-                            echo "⚠️ swagger-analysis.json 없음 — Semgrep 결과만 사용"
+                            echo "swagger-analysis.json 없음 -- Semgrep 결과만 사용"
                         }
 
-                        // ── 취약점별 Risk Score 산정 ───────────────────────
                         def vulnBusinessScores = []
 
                         def sourceFiles = fileExists("${WORKSPACE}/output/merged_vulns.json")
@@ -509,7 +667,7 @@ print("[저장]      " + OUTPUT_FILE)
                                         if (v.CVSS) {
                                             ['nvd', 'ghsa', 'redhat'].each { src ->
                                                 if (v.CVSS[src] && cvss == 0.0) {
-                                                    // ✅ [버그 수정] V3Score/V2Score JSONNull 안전 처리
+                                                    // [버그 수정] JSONNull 안전 처리
                                                     def v3 = v.CVSS[src]?.V3Score
                                                     def v2 = v.CVSS[src]?.V2Score
                                                     if (v3 != null && !(v3 instanceof net.sf.json.JSONNull)) {
@@ -536,8 +694,7 @@ print("[저장]      " + OUTPUT_FILE)
                             }
 
                             vulnList.each { vuln ->
-                                // ✅ [버그 수정] cvss 필드 JSONNull 안전 처리
-                                // Python None → JSON null → Groovy JSONNull → "as double" 예외 발생
+                                // [버그 수정] cvss JSONNull 안전 처리
                                 def rawCvss   = vuln.cvss
                                 def cvssScore = (rawCvss != null && !(rawCvss instanceof net.sf.json.JSONNull))
                                     ? (rawCvss as double) : 0.0
@@ -573,7 +730,7 @@ print("[저장]      " + OUTPUT_FILE)
                                 swaggerEndpoints.each { ep ->
                                     def epPath = (ep.path ?: '').toLowerCase()
                                     if (pkgName.length() >= 4 && epPath.contains(pkgName)) {
-                                        // ✅ [버그 수정] ep.biz_score JSONNull 안전 처리
+                                        // [버그 수정] biz_score JSONNull 안전 처리
                                         def rawBiz     = ep.biz_score
                                         def epBizScore = (rawBiz != null && !(rawBiz instanceof net.sf.json.JSONNull))
                                             ? (rawBiz as int) : 0
@@ -595,7 +752,7 @@ print("[저장]      " + OUTPUT_FILE)
                                     if (isReachable) reachability = 1.5
                                 }
 
-                                // ✅ [버그 수정] source_count JSONNull 안전 처리
+                                // [버그 수정] source_count JSONNull 안전 처리
                                 def rawSrcCount = vuln.source_count
                                 def srcCount    = (rawSrcCount != null && !(rawSrcCount instanceof net.sf.json.JSONNull))
                                     ? (rawSrcCount as int) : 1
@@ -606,9 +763,9 @@ print("[저장]      " + OUTPUT_FILE)
                                 def rawScore     = cvssScore * reachability * effectiveBiz * trustWeight
                                 def finalScore   = (rawScore / MAX_RAW) * 20.0
 
-                                def gate = finalScore >= 14.0 ? '🔴 차단(Block)' :
-                                           finalScore >=  8.0 ? '🟠 경고(Warn)'  :
-                                                                '🟢 정상(Pass)'
+                                def gate = finalScore >= 14.0 ? '차단(Block)' :
+                                           finalScore >=  8.0 ? '경고(Warn)'  :
+                                                                '정상(Pass)'
 
                                 vulnBusinessScores.add([
                                     pkg         : vuln.package ?: '',
@@ -657,7 +814,7 @@ print("[저장]      " + OUTPUT_FILE)
                             def kwInfo   = v.matchedKw ? "(키워드:${v.matchedKw})" : ""
                             def trustStr = String.format('%.2f', v.trustWeight as double)
                             echo "${i+1}위 | ${v.cve} | ${v.pkg}@${v.version} [${v.source}]"
-                            echo "     CVSS:${v.cvss} | ${v.bizCategory}(+${v.bizScore})${kwInfo} | Reach:x${v.reachability} | 신뢰도:x${trustStr}(${v.sourceCount}개소스) | raw:${rawStr} → 최종:${finalStr}/20점 | ${v.gate}"
+                            echo "     CVSS:${v.cvss} | ${v.bizCategory}(+${v.bizScore})${kwInfo} | Reach:x${v.reachability} | 신뢰도:x${trustStr}(${v.sourceCount}개소스) | raw:${rawStr} -> 최종:${finalStr}/20점 | ${v.gate}"
                         }
 
                         def blockCount = 0
@@ -671,9 +828,9 @@ print("[저장]      " + OUTPUT_FILE)
                         }
 
                         echo "======================================================"
-                        echo "  🔴 차단(Block) : ${blockCount}건 (14점 이상/20점)"
-                        echo "  🟠 경고(Warn)  : ${warnCount}건  (8~13점/20점)"
-                        echo "  🟢 정상(Pass)  : ${passCount}건  (0~7점/20점)"
+                        echo "  차단(Block) : ${blockCount}건 (14점 이상/20점)"
+                        echo "  경고(Warn)  : ${warnCount}건  (8~13점/20점)"
+                        echo "  정상(Pass)  : ${passCount}건  (0~7점/20점)"
                         echo "======================================================"
 
                         writeJSON file: "${WORKSPACE}/output/business-risk-result.json",
@@ -739,7 +896,7 @@ print("[저장]      " + OUTPUT_FILE)
                     if (fileExists("${WORKSPACE}/output/business-risk-result.json")) {
                         def bizJson = readJSON file: "${WORKSPACE}/output/business-risk-result.json"
                         bizJson.each { v ->
-                            // ✅ [버그 수정] finalScore JSONNull 안전 처리
+                            // [버그 수정] finalScore JSONNull 안전 처리
                             def raw   = v.finalScore
                             def score = (raw != null && !(raw instanceof net.sf.json.JSONNull))
                                 ? (raw as double) : 0.0
@@ -764,49 +921,49 @@ print("[저장]      " + OUTPUT_FILE)
                         swaggerHighRisk = swaggerJson.summary?.high_risk?.size() ?: 0
                     }
 
-                    def baseGate = baseScore >= 50.0 ? '🔴 차단' :
-                                   baseScore >= 30.0 ? '🟠 경고' : '🟢 정상'
+                    def baseGate = baseScore >= 50.0 ? '차단' :
+                                   baseScore >= 30.0 ? '경고' : '정상'
 
                     echo """
-                    ======================================================
-                    Semgrep 발견              : ${semgrepCount}건
-                    병합 총 취약점            : ${totalVulns}건
-                      ├ CRITICAL             : ${mergedCritCount}건 (${critPctStr}%)
-                      └ HIGH                 : ${mergedHighCount}건 (${highPctStr}%)
-                    npm audit HIGH           : ${npmHighCount}건
-                    npm audit CRITICAL       : ${npmCritCount}건
-                    Swagger 고위험 Endpoint  : ${swaggerHighRisk}개 (score>=5)
-                    ---------------------------
-                    기본 리스크 점수         : ${baseScoreStr}점 ${baseGate}
-                      CRITICAL비율×100 = ${String.format('%.1f', criticalRatio * 100)}점
-                      HIGH비율×40      = ${String.format('%.1f', highRatio * 40)}점
-                      Semgrep×0.2      = ${String.format('%.1f', semgrepCount * 0.2)}점
-                    임계값: 차단 50점↑ / 경고 30점↑ / 정상 30점↓
-                    ---------------------------
-                    비즈니스 최고 점수       : ${maxScoreStr}/20점
-                    🔴 차단(Block) 14점 이상 : ${blockCount}건
-                    🟠 경고(Warn)  8~13점    : ${warnCount}건
-                    ======================================================
-                    """
+======================================================
+Semgrep 발견              : ${semgrepCount}건
+병합 총 취약점            : ${totalVulns}건
+  CRITICAL               : ${mergedCritCount}건 (${critPctStr}%)
+  HIGH                   : ${mergedHighCount}건 (${highPctStr}%)
+npm audit HIGH           : ${npmHighCount}건
+npm audit CRITICAL       : ${npmCritCount}건
+Swagger 고위험 Endpoint  : ${swaggerHighRisk}개 (score>=5)
+---------------------------
+기본 리스크 점수         : ${baseScoreStr}점 ${baseGate}
+  CRITICAL비율x100 = ${String.format('%.1f', criticalRatio * 100)}점
+  HIGH비율x40      = ${String.format('%.1f', highRatio * 40)}점
+  Semgrepx0.2      = ${String.format('%.1f', semgrepCount * 0.2)}점
+임계값: 차단 50점 / 경고 30점 / 정상 30점 미만
+---------------------------
+비즈니스 최고 점수       : ${maxScoreStr}/20점
+차단(Block) 14점 이상    : ${blockCount}건
+경고(Warn)  8~13점       : ${warnCount}건
+======================================================
+"""
 
                     if (blockCount > 0) {
                         currentBuild.result = 'FAILURE'
-                        echo "🚨 비즈니스 차단(Block) 취약점 ${blockCount}건 발견 (14점/20점 이상)! 빌드 차단!"
+                        echo "비즈니스 차단(Block) 취약점 ${blockCount}건 발견 (14점/20점 이상)! 빌드 차단!"
                     } else if (baseScore >= 50.0) {
                         currentBuild.result = 'FAILURE'
-                        echo "🚨 기본 리스크 점수 ${baseScoreStr}점 ≥ 임계값 50점! 빌드 차단!"
+                        echo "기본 리스크 점수 ${baseScoreStr}점 -- 임계값 50점 초과! 빌드 차단!"
                     } else if (baseScore >= 30.0) {
                         currentBuild.result = 'UNSTABLE'
-                        echo "⚠️ 기본 리스크 점수 ${baseScoreStr}점 — 경고 구간 (30~50점), 배포 주의"
+                        echo "기본 리스크 점수 ${baseScoreStr}점 -- 경고 구간 (30~50점), 배포 주의"
                     } else {
-                        echo "✅ 리스크 점수 통과 (${baseScoreStr}점)"
+                        echo "리스크 점수 통과 (${baseScoreStr}점)"
                     }
                 }
             }
         }
 
         // =====================================================================
-        // stage 9 — Prometheus Pushgateway 메트릭 전송
+        // stage 9 -- Prometheus Pushgateway 메트릭 전송
         // =====================================================================
         stage('9. Prometheus Push') {
             steps {
@@ -831,7 +988,7 @@ print("[저장]      " + OUTPUT_FILE)
                     }
 
                     bizJson.each { v ->
-                        // ✅ [버그 수정] finalScore JSONNull 안전 처리
+                        // [버그 수정] finalScore JSONNull 안전 처리
                         def raw   = v.finalScore
                         def score = (raw != null && !(raw instanceof net.sf.json.JSONNull))
                             ? (raw as double) : 0.0
@@ -846,10 +1003,10 @@ print("[저장]      " + OUTPUT_FILE)
                     def highRatio    = totalVulns > 0 ? (highCount  / totalVulns as double) : 0.0
                     def baseScore    = (critRatio * 100) + (highRatio * 40) + (semgrepCount * 0.2)
 
-                    def metrics = """# HELP trivy_pipe_risk_score 비즈니스 최고 Risk Score (20점 기준)
+                    def metrics = """# HELP trivy_pipe_risk_score Risk Score (20점 기준)
 # TYPE trivy_pipe_risk_score gauge
 trivy_pipe_risk_score ${String.format('%.2f', maxScore)}
-# HELP trivy_pipe_base_score 기본 리스크 점수 (비율 기반)
+# HELP trivy_pipe_base_score 기본 리스크 점수
 # TYPE trivy_pipe_base_score gauge
 trivy_pipe_base_score ${String.format('%.1f', baseScore)}
 # HELP trivy_pipe_critical_count CRITICAL 취약점 수
@@ -861,10 +1018,10 @@ trivy_pipe_high_count ${highCount}
 # HELP trivy_pipe_total_vulns 전체 고유 취약점 수
 # TYPE trivy_pipe_total_vulns gauge
 trivy_pipe_total_vulns ${mergedJson.size()}
-# HELP trivy_pipe_block_count 차단(Block) 취약점 수
+# HELP trivy_pipe_block_count 차단 취약점 수
 # TYPE trivy_pipe_block_count gauge
 trivy_pipe_block_count ${blockCount}
-# HELP trivy_pipe_warn_count 경고(Warn) 취약점 수
+# HELP trivy_pipe_warn_count 경고 취약점 수
 # TYPE trivy_pipe_warn_count gauge
 trivy_pipe_warn_count ${warnCount}
 # HELP trivy_pipe_semgrep_count Semgrep 발견 수
@@ -880,8 +1037,8 @@ trivy_pipe_build_status ${blockCount > 0 || baseScore >= 50.0 ? 0 : 1}
                         curl -s -X POST \\
                             http://pushgateway:9091/metrics/job/trivy-pipe/instance/juice-shop \\
                             --data-binary @${WORKSPACE}/output/metrics.txt \\
-                        && echo "✅ Prometheus Push 완료" \\
-                        || echo "⚠️ Prometheus Push 실패 (Pushgateway 미연결)"
+                        && echo "Prometheus Push 완료" \\
+                        || echo "Prometheus Push 실패 (Pushgateway 미연결)"
                     """
                 }
             }
@@ -895,16 +1052,16 @@ trivy_pipe_build_status ${blockCount > 0 || baseScore >= 50.0 ? 0 : 1}
                 if (fileExists('output/dependency-check-report.xml')) {
                     dependencyCheckPublisher pattern: 'output/dependency-check-report.xml'
                 } else {
-                    echo "⚠️ OWASP 리포트 없음 - Publisher 스킵"
+                    echo "OWASP 리포트 없음 - Publisher 스킵"
                 }
             }
             echo "결과: ${currentBuild.currentResult}"
         }
         success {
-            echo "✅ 파이프라인 성공"
+            echo "파이프라인 성공"
         }
         failure {
-            echo "❌ 파이프라인 실패 - 로그를 확인하세요"
+            echo "파이프라인 실패 - 로그를 확인하세요"
         }
     }
 }
