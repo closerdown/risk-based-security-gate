@@ -478,7 +478,11 @@ print("high_risk count=" + str(len(summary["high_risk"])))
 
                             vulnList.each { vuln ->
                                 def rawCvss   = vuln.cvss
-                                def cvssScore = (rawCvss != null) ? (rawCvss as double) : 0.0
+                                def cvssScore = 0.0
+                                try {
+                                    if (rawCvss != null && rawCvss.toString() != 'null')
+                                        cvssScore = Double.parseDouble(rawCvss.toString())
+                                } catch (Exception e) { cvssScore = 0.0 }
                                 if (cvssScore == 0.0)
                                     cvssScore = (vuln.severity == 'CRITICAL') ? 9.0 : 7.0
 
@@ -584,7 +588,12 @@ print("high_risk count=" + str(len(summary["high_risk"])))
                     if (fileExists("${WORKSPACE}/output/business-risk-result.json")) {
                         def bizJson = readJSON file: "${WORKSPACE}/output/business-risk-result.json"
                         bizJson.each { v ->
-                            def s = (v.finalScore != null) ? (v.finalScore as double) : 0.0
+                            def s = 0.0
+                            try {
+                                def raw = v.finalScore
+                                if (raw != null && raw.toString() != 'null')
+                                    s = Double.parseDouble(raw.toString())
+                            } catch (Exception e) { s = 0.0 }
                             if (s > maxFinal) maxFinal = s
                             if (s >= 14.0) blockCount++
                             else if (s >= 8.0) warnCount++
@@ -641,7 +650,12 @@ print("high_risk count=" + str(len(summary["high_risk"])))
                         if (sev=='HIGH') high++
                     }
                     bizJson.each { v ->
-                        def s = (v.finalScore != null) ? (v.finalScore as double) : 0.0
+                        def s = 0.0
+                        try {
+                            def raw = v.finalScore
+                            if (raw != null && raw.toString() != 'null')
+                                s = Double.parseDouble(raw.toString())
+                        } catch (Exception e) { s = 0.0 }
                         if (s > maxS) maxS = s
                         if (s >= 14.0) block++
                         else if (s >= 8.0) warn++
