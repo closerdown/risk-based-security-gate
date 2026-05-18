@@ -285,7 +285,7 @@ SWAGGER_FILE = WS + "/src/swagger.yml"
 OUTPUT_FILE  = WS + "/output/swagger-analysis.json"
 
 BIZ_CATEGORIES = [
-    {"name":"payment",  "score":5,"keywords":["pay","payment","checkout","purchase","billing","charge","refund","transaction","pg","card","bank","stripe","invoice"]},
+    {"name":"payment",  "score":5,"keywords":["pay","payment","checkout","purchase","billing","charge","refund","transaction","pg","card","bank","stripe","invoice","order","orders"]},
     {"name":"auth",     "score":4,"keywords":["auth","login","logout","register","signup","password","token","oauth","session","credential","jwt","saml"]},
     {"name":"admin",    "score":4,"keywords":["admin","manager","dashboard","console","superuser","root","config","setting"]},
     {"name":"inventory","score":4,"keywords":["price","stock","inventory","quantity","discount","product-edit"]},
@@ -381,7 +381,8 @@ print("high_risk count=" + str(len(summary["high_risk"])))
                         def businessKeywords = [
                             payment  : [score: 5, keywords: ['pay', 'payment', 'checkout', 'purchase', 'billing',
                                                               'charge', 'refund', 'transaction', 'pg', 'card', 'bank',
-                                                              'stripe', 'braintree', 'paypal', 'invoice', 'receipt']],
+                                                              'stripe', 'braintree', 'paypal', 'invoice', 'receipt',
+                                                              'order', 'orders']],
                             auth     : [score: 4, keywords: ['auth', 'jwt', 'jsonwebtoken', 'token', 'oauth',
                                                               'passport', 'session', 'credential', 'login', 'saml',
                                                               'bcrypt', 'argon', 'scrypt', 'otplib', 'speakeasy',
