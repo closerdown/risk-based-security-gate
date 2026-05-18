@@ -121,7 +121,7 @@ pipeline {
                     }
 
                     writeFile file: "${WORKSPACE}/output/merge_vulns.py", text: '''
-import json, xml.etree.ElementTree as ET, os, re
+import json, os, re
 from collections import Counter
 
 WS = os.environ["WORKSPACE"]
@@ -131,11 +131,12 @@ TRIVY_FILES = [
     WS + "/output/trivy-nodemodules-result.json",
     WS + "/output/trivy-sbom-result.json",
 ]
-OWASP_FILE  = WS + "/output/dependency-check-report.xml"
+OWASP_JSON  = WS + "/output/dependency-check-report.json"
 NPM_FILES   = [WS + "/output/npm-audit-root.json", WS + "/output/npm-audit-frontend.json"]
 OUTPUT_FILE = WS + "/output/merged_vulns.json"
 
 SEV_MAP = {"critical":"CRITICAL","high":"HIGH","moderate":"MEDIUM","medium":"MEDIUM","low":"LOW","info":"INFO"}
+SEV_FALLBACK = {"CRITICAL": 9.0, "HIGH": 7.5, "MEDIUM": 5.5, "LOW": 2.0}
 
 def norm_sev(s):
     return SEV_MAP.get((s or "").lower(), "UNKNOWN")
@@ -163,31 +164,76 @@ def parse_trivy(paths):
     print("[Trivy] " + str(len(vulns)) + " entries")
     return vulns
 
-def parse_owasp(path):
+def parse_owasp_json(path):
+    """OWASP JSON 리포트 파싱 — CVSS 없으면 severity 기반 추정"""
     vulns = {}
     if not os.path.exists(path):
+        print("[OWASP] JSON 파일 없음 — 스킵")
         return vulns
-    tree = ET.parse(path)
-    root = tree.getroot()
-    ns  = root.tag.split("}")[0].strip("{") if "}" in root.tag else ""
-    tag = lambda t: ("{" + ns + "}" + t) if ns else t
-    for dep in root.iter(tag("dependency")):
-        raw = dep.findtext(tag("fileName")) or ""
-        pkg = re.sub(r"\\.(tgz|jar|zip|tar\\.gz|war|ear)$", "", raw)
-        pkg = re.sub(r"-[\\d]+\\.[\\d].*$", "", pkg).lower().strip()
-        for vuln in dep.iter(tag("vulnerability")):
-            vid = vuln.findtext(tag("name")) or ""
-            if not (vid.startswith("CVE-") or vid.startswith("GHSA-")):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError:
+            print("[OWASP] JSON 파싱 오류")
+            return vulns
+
+    sev_map = {
+        "CRITICAL": "CRITICAL", "HIGH": "HIGH",
+        "MEDIUM": "MEDIUM",     "MODERATE": "MEDIUM",
+        "LOW": "LOW",           "INFO": "INFO"
+    }
+
+    for dep in data.get("dependencies", []):
+        pkg = dep.get("fileName", "unknown")
+        for vuln in dep.get("vulnerabilities", []):
+            vid = vuln.get("name", "")
+            if not vid:
                 continue
-            try:
-                raw_cvss = float(vuln.findtext(tag("cvssV3")) or vuln.findtext(tag("cvssScore")) or 0)
-                cvss = raw_cvss if raw_cvss > 0 else None
-            except ValueError:
-                cvss = None
-            sev = norm_sev(vuln.findtext(tag("severity")) or "")
+            sev = sev_map.get(vuln.get("severity", "").upper(), "UNKNOWN")
+
+            # CVSS 추출 — v3 우선, v2 fallback
+            cvss = None
+            for key in ["cvssv3", "cvssV3", "cvss3"]:
+                cvssv3 = vuln.get(key) or {}
+                for score_key in ["baseScore", "score"]:
+                    val = cvssv3.get(score_key)
+                    if val is not None:
+                        try:
+                            f = float(val)
+                            if f > 0:
+                                cvss = f
+                                break
+                        except (ValueError, TypeError):
+                            pass
+                if cvss:
+                    break
+
+            if not cvss:
+                for key in ["cvssv2", "cvssV2", "cvss2"]:
+                    cvssv2 = vuln.get(key) or {}
+                    for score_key in ["score", "baseScore"]:
+                        val = cvssv2.get(score_key)
+                        if val is not None:
+                            try:
+                                f = float(val)
+                                if f > 0:
+                                    cvss = f
+                                    break
+                            except (ValueError, TypeError):
+                                pass
+                    if cvss:
+                        break
+
+            # CVSS 없으면 severity 기반 추정
+            if not cvss:
+                cvss = SEV_FALLBACK.get(sev, 5.0)
+
             prev = vulns.get(vid)
             if prev is None or (cvss is not None and (prev["cvss"] is None or cvss > prev["cvss"])):
-                vulns[vid] = {"vuln_id":vid,"package":pkg,"version":"","severity":sev,"cvss":cvss,"source":"owasp"}
+                vulns[vid] = {
+                    "vuln_id": vid, "package": pkg, "version": "",
+                    "severity": sev, "cvss": cvss, "source": "owasp"
+                }
     print("[OWASP] " + str(len(vulns)) + " entries")
     return vulns
 
@@ -242,12 +288,18 @@ def merge(trivy, owasp, npm):
     return merged
 
 trivy  = parse_trivy(TRIVY_FILES)
-owasp  = parse_owasp(OWASP_FILE)
+owasp  = parse_owasp_json(OWASP_JSON)
 npm    = parse_npm(NPM_FILES)
 merged = merge(trivy, owasp, npm)
 print("[merged] total=" + str(len(merged)))
+
+# CVSS 없는 항목 통계
+none_count = sum(1 for v in merged if v["cvss"] is None)
+print("[CVSS 없음] " + str(none_count) + "개 (severity 추정값 적용됨)")
+
 with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
     json.dump(merged, f, indent=2, ensure_ascii=False)
+print("[저장] " + OUTPUT_FILE)
 '''
                     sh "python3 ${WORKSPACE}/output/merge_vulns.py"
                 }
