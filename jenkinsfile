@@ -1,546 +1,786 @@
-"""
-security_metrics.py
-Jenkins stage 10에서 실행되는 보안 결과 집계 + Prometheus Pushgateway 전송 스크립트.
-"""
+pipeline {
+    agent any
 
-import json
-import os
-import sys
-import re
-import logging
-from collections import defaultdict
+    triggers {
+        githubPush()
+    }
+
+    tools {
+        "dependency-check" 'dependency-check'
+    }
+
+    stages {
+
+        stage('1. Workspace Init') {
+            steps {
+                sh """
+                    rm -rf ${WORKSPACE}/src ${WORKSPACE}/output
+                    mkdir -p ${WORKSPACE}/src ${WORKSPACE}/output
+                """
+            }
+        }
+
+        stage('2. Source Code Checkout') {
+            steps {
+                dir("${WORKSPACE}/src") {
+                    git url: 'https://github.com/juice-shop/juice-shop.git', branch: 'master'
+                    sh 'ls -la'
+                }
+            }
+        }
+
+        stage('3. Dependency Install') {
+            steps {
+                dir("${WORKSPACE}/src") {
+                    script {
+                        docker.image('node:20').inside('--user root') {
+                            sh """
+                                node --version && npm --version
+                                npm install --legacy-peer-deps
+                                npm install --package-lock-only --legacy-peer-deps --ignore-scripts
+                                cd frontend && npm install --package-lock-only --legacy-peer-deps --ignore-scripts && cd ..
+                                npm audit --json > ${WORKSPACE}/output/npm-audit-root.json 2>/dev/null || true
+                                cd frontend && npm audit --json > ${WORKSPACE}/output/npm-audit-frontend.json 2>/dev/null || true
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('4. Semgrep SAST Scan') {
+            steps {
+                dir("${WORKSPACE}/src") {
+                    script {
+                        docker.image('returntocorp/semgrep:latest').inside('--user root') {
+                            sh """
+                                semgrep --config=auto --json \\
+                                    --output=${WORKSPACE}/output/semgrep-result.json \\
+                                    . || true
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('5. Trivy SCA Scan') {
+            steps {
+                dir("${WORKSPACE}/src") {
+                    script {
+                        docker.image('aquasec/trivy:latest').inside('--user root --entrypoint= -v /tmp/trivy-cache:/root/.cache') {
+                            sh """
+                                trivy fs --scanners vuln --pkg-types library --format json \\
+                                    --output ${WORKSPACE}/output/trivy-result.json \\
+                                    --severity HIGH,CRITICAL --include-dev-deps --skip-dirs frontend . || true
+
+                                trivy fs --scanners vuln --pkg-types library --format json \\
+                                    --output ${WORKSPACE}/output/trivy-frontend-result.json \\
+                                    --severity HIGH,CRITICAL --include-dev-deps ./frontend || true
+
+                                trivy fs --scanners vuln --pkg-types library --format json \\
+                                    --output ${WORKSPACE}/output/trivy-nodemodules-result.json \\
+                                    --severity HIGH,CRITICAL ${WORKSPACE}/src/node_modules || true
+
+                                if [ -f ${WORKSPACE}/src/frontend/dist/bom/bom.json ]; then
+                                    trivy sbom --format json \\
+                                        --output ${WORKSPACE}/output/trivy-sbom-result.json \\
+                                        --severity HIGH,CRITICAL \\
+                                        ${WORKSPACE}/src/frontend/dist/bom/bom.json || true
+                                fi
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('6. OWASP Dependency Check') {
+            steps {
+                dir("${WORKSPACE}/src") {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        withCredentials([string(credentialsId: 'NVD_API_KEY', variable: 'NVD_KEY')]) {
+                            dependencyCheck(
+                                odcInstallation: 'dependency-check',
+                                additionalArguments: '--nvdApiKey $NVD_KEY --format JSON --format HTML --format XML --out $WORKSPACE/output --scan . --disableYarnAudit --disableOssIndex --data /var/jenkins_home/owasp-data'
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('6.5. CVE Merge & Dedup') {
+            steps {
+                script {
+                    def anyTrivy = fileExists("${WORKSPACE}/output/trivy-result.json") ||
+                                   fileExists("${WORKSPACE}/output/trivy-frontend-result.json")
+                    if (!anyTrivy) {
+                        echo "Trivy result missing - skip CVE merge"
+                        return
+                    }
+
+                    writeFile file: "${WORKSPACE}/output/merge_vulns.py", text: '''
+import json, xml.etree.ElementTree as ET, os, re
+from collections import Counter
+
+WS = os.environ["WORKSPACE"]
+TRIVY_FILES = [
+    WS + "/output/trivy-result.json",
+    WS + "/output/trivy-frontend-result.json",
+    WS + "/output/trivy-nodemodules-result.json",
+    WS + "/output/trivy-sbom-result.json",
+]
+OWASP_FILE  = WS + "/output/dependency-check-report.xml"
+NPM_FILES   = [WS + "/output/npm-audit-root.json", WS + "/output/npm-audit-frontend.json"]
+OUTPUT_FILE = WS + "/output/merged_vulns.json"
+
+SEV_MAP = {"critical":"CRITICAL","high":"HIGH","moderate":"MEDIUM","medium":"MEDIUM","low":"LOW","info":"INFO"}
+
+def norm_sev(s):
+    return SEV_MAP.get((s or "").lower(), "UNKNOWN")
+
+def parse_trivy(paths):
+    vulns = {}
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        for result in data.get("Results", []):
+            for v in result.get("Vulnerabilities") or []:
+                vid = v.get("VulnerabilityID")
+                if not vid:
+                    continue
+                cvss = None
+                for src in (v.get("CVSS") or {}).values():
+                    val = float(src.get("V3Score") or src.get("V2Score") or 0)
+                    if val > 0:
+                        cvss = max(cvss, val) if cvss is not None else val
+                prev = vulns.get(vid)
+                if prev is None or (cvss is not None and (prev["cvss"] is None or cvss > prev["cvss"])):
+                    vulns[vid] = {"vuln_id":vid,"package":v.get("PkgName",""),"version":v.get("InstalledVersion",""),"severity":v.get("Severity","UNKNOWN"),"cvss":cvss,"source":"trivy"}
+    print("[Trivy] " + str(len(vulns)) + " entries")
+    return vulns
+
+def parse_owasp(path):
+    vulns = {}
+    if not os.path.exists(path):
+        return vulns
+    tree = ET.parse(path)
+    root = tree.getroot()
+    ns  = root.tag.split("}")[0].strip("{") if "}" in root.tag else ""
+    tag = lambda t: ("{" + ns + "}" + t) if ns else t
+    for dep in root.iter(tag("dependency")):
+        raw = dep.findtext(tag("fileName")) or ""
+        pkg = re.sub(r"\\.(tgz|jar|zip|tar\\.gz|war|ear)$", "", raw)
+        pkg = re.sub(r"-[\\d]+\\.[\\d].*$", "", pkg).lower().strip()
+        for vuln in dep.iter(tag("vulnerability")):
+            vid = vuln.findtext(tag("name")) or ""
+            if not (vid.startswith("CVE-") or vid.startswith("GHSA-")):
+                continue
+            try:
+                raw_cvss = float(vuln.findtext(tag("cvssV3")) or vuln.findtext(tag("cvssScore")) or 0)
+                cvss = raw_cvss if raw_cvss > 0 else None
+            except ValueError:
+                cvss = None
+            sev = norm_sev(vuln.findtext(tag("severity")) or "")
+            prev = vulns.get(vid)
+            if prev is None or (cvss is not None and (prev["cvss"] is None or cvss > prev["cvss"])):
+                vulns[vid] = {"vuln_id":vid,"package":pkg,"version":"","severity":sev,"cvss":cvss,"source":"owasp"}
+    print("[OWASP] " + str(len(vulns)) + " entries")
+    return vulns
+
+def parse_npm(paths):
+    vulns = {}
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError:
+                continue
+        for pkg_name, info in (data.get("vulnerabilities") or {}).items():
+            sev = norm_sev(info.get("severity", ""))
+            for via in (info.get("via") or []):
+                if not isinstance(via, dict):
+                    continue
+                vid = via.get("cve", "")
+                if not vid:
+                    url = via.get("url", "")
+                    if "GHSA-" in url:
+                        vid = "GHSA-" + url.split("GHSA-")[-1].split("/")[0]
+                    elif via.get("source"):
+                        vid = "NPM-" + str(via.get("source"))
+                    else:
+                        continue
+                raw_score = float((via.get("cvss") or {}).get("score") or 0)
+                cvss = raw_score if raw_score > 0 else None
+                prev = vulns.get(vid)
+                if prev is None or (cvss is not None and (prev["cvss"] is None or cvss > prev["cvss"])):
+                    vulns[vid] = {"vuln_id":vid,"package":pkg_name,"version":info.get("range",""),"severity":sev,"cvss":cvss,"source":"npm"}
+    print("[npm] " + str(len(vulns)) + " entries")
+    return vulns
+
+def merge(trivy, owasp, npm):
+    merged = []
+    for vid in sorted(set(trivy) | set(owasp) | set(npm)):
+        sources, entry = [], None
+        for d, label in [(trivy,"trivy"),(npm,"npm"),(owasp,"owasp")]:
+            if vid in d:
+                sources.append(label)
+                if entry is None:
+                    entry = d[vid].copy()
+                else:
+                    a, b = entry["cvss"], d[vid]["cvss"]
+                    entry["cvss"] = max(a,b) if a is not None and b is not None else (a if a is not None else b)
+        entry["source"] = "+".join(sources)
+        entry["source_count"] = len(sources)
+        merged.append(entry)
+    merged.sort(key=lambda x: x["cvss"] if x["cvss"] is not None else -1, reverse=True)
+    return merged
+
+trivy  = parse_trivy(TRIVY_FILES)
+owasp  = parse_owasp(OWASP_FILE)
+npm    = parse_npm(NPM_FILES)
+merged = merge(trivy, owasp, npm)
+print("[merged] total=" + str(len(merged)))
+with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+    json.dump(merged, f, indent=2, ensure_ascii=False)
+'''
+                    sh "python3 ${WORKSPACE}/output/merge_vulns.py"
+                }
+            }
+            post {
+                failure { echo "CVE merge failed" }
+            }
+        }
+
+        stage('6.7. Swagger Analysis') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                        if (!fileExists("${WORKSPACE}/src/swagger.yml")) {
+                            echo "swagger.yml not found - skip"
+                            return
+                        }
+                        sh "rm -f ${WORKSPACE}/output/swagger-analysis.json"
+
+                        writeFile file: "${WORKSPACE}/output/parse_swagger.py", text: '''
+import json, os, re, sys
 
 try:
-    from prometheus_client import (
-        CollectorRegistry, Gauge, push_to_gateway
-    )
+    import yaml
 except ImportError:
     import subprocess
-
-    def _try_install():
-        subprocess.run(["apt-get", "update", "-qq"], capture_output=True)
-        subprocess.run(["apt-get", "install", "-y", "-q", "python3-pip"], capture_output=True)
-        r = subprocess.run(
-            [sys.executable, "-m", "pip", "install",
-             "prometheus_client", "--break-system-packages", "-q"],
-            capture_output=True
-        )
-        return r.returncode == 0
-
-    if not _try_install():
-        print("[ERROR] prometheus_client 설치 실패")
-        sys.exit(1)
-
-    from prometheus_client import (
-        CollectorRegistry, Gauge, push_to_gateway
-    )
-
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
-
-WORKSPACE       = os.environ.get("WORKSPACE", ".")
-OUTPUT_DIR      = os.path.join(WORKSPACE, "output")
-PUSHGATEWAY_URL = os.environ.get("PUSHGATEWAY_URL", "pushgateway:9091")
-JOB_NAME        = "supplychain_scan"
-
-SEV_WEIGHT = {"CRITICAL": 5, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
-SEV_LIST   = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
-
-
-def p(filename):
-    return os.path.join(OUTPUT_DIR, filename)
-
-
-def safe_cvss(v):
-    """CVSS None/0 안전 처리 — None이면 None 반환"""
-    val = v.get("cvss")
-    if val is None:
-        return None
     try:
-        f = float(val)
-        return f if f > 0 else None
-    except (TypeError, ValueError):
-        return None
+        subprocess.run(["apt-get","install","-y","-q","python3-yaml"], check=True, capture_output=True)
+    except Exception:
+        subprocess.run([sys.executable,"-m","pip","install","pyyaml","--break-system-packages","-q"], check=True)
+    import yaml
 
+WS           = os.environ["WORKSPACE"]
+SWAGGER_FILE = WS + "/src/swagger.yml"
+OUTPUT_FILE  = WS + "/output/swagger-analysis.json"
 
-def cvss_for_score(v):
-    """점수 계산용 — None이면 severity 기반 추정값 반환."""
-    val = safe_cvss(v)
-    if val is not None:
-        return val
-    sev = v.get("severity", "LOW").upper()
-    return float(SEV_WEIGHT.get(sev, 1)) * 1.5
+BIZ_CATEGORIES = [
+    {"name":"payment",  "score":5,"keywords":["pay","payment","checkout","purchase","billing","charge","refund","transaction","pg","card","bank","stripe","invoice","order","orders"]},
+    {"name":"auth",     "score":4,"keywords":["auth","login","logout","register","signup","password","token","oauth","session","credential","jwt","saml"]},
+    {"name":"admin",    "score":4,"keywords":["admin","manager","dashboard","console","superuser","root","config","setting"]},
+    {"name":"inventory","score":4,"keywords":["price","stock","inventory","quantity","discount","product-edit"]},
+    {"name":"sandbox",  "score":4,"keywords":["vm","sandbox","eval","execute","template"]},
+    {"name":"personal", "score":3,"keywords":["user","profile","personal","privacy","email","phone","address","delivery","shipping","ssn","kyc"]},
+    {"name":"coupon",   "score":3,"keywords":["coupon","point","voucher","reward","promo"]},
+    {"name":"security", "score":3,"keywords":["sanitize","xss","escape","helmet","validator","sql","inject"]},
+    {"name":"product",  "score":1,"keywords":["product","item","catalog","search","list","category"]},
+]
+PUBLIC_METHODS = {"get","post","put","patch","delete"}
 
+def get_biz_score(path_str):
+    p = path_str.lower()
+    for cat in BIZ_CATEGORIES:
+        for kw in cat["keywords"]:
+            if len(kw) >= 3 and kw in p:
+                return cat["score"], cat["name"], kw
+    return 0, "internal", ""
 
-def parse_trivy() -> list:
-    vulns = []
-    files = [
-        p("trivy-result.json"),
-        p("trivy-frontend-result.json"),
-        p("trivy-nodemodules-result.json"),
-    ]
-    for fpath in files:
-        if not os.path.exists(fpath):
+with open(SWAGGER_FILE, encoding="utf-8") as f:
+    spec = yaml.safe_load(f)
+
+base_path = (spec.get("basePath") or "").rstrip("/")
+paths     = spec.get("paths") or {}
+endpoints = []
+summary   = {"total":0,"by_category":{},"by_method":{},"high_risk":[]}
+
+for path, path_item in paths.items():
+    if not isinstance(path_item, dict):
+        continue
+    for method, operation in path_item.items():
+        if method.lower() not in PUBLIC_METHODS or not isinstance(operation, dict):
             continue
-        try:
-            with open(fpath, encoding="utf-8", errors="replace") as f:
-                data = json.load(f)
-            for result in data.get("Results", []):
-                for v in result.get("Vulnerabilities") or []:
-                    vid = v.get("VulnerabilityID", "")
-                    sev = v.get("Severity", "UNKNOWN").upper()
-                    if sev not in SEV_WEIGHT:
-                        sev = "LOW"
-                    pkg = v.get("PkgName", "unknown")
-                    cvss = None
-                    for src in (v.get("CVSS") or {}).values():
-                        val = float(src.get("V3Score") or src.get("V2Score") or 0)
-                        if val > 0:
-                            cvss = max(cvss, val) if cvss is not None else val
-                    vulns.append({
-                        "tool": "trivy", "cve": vid,
-                        "severity": sev, "package": pkg, "cvss": cvss
-                    })
-        except Exception as e:
-            log.error("[Trivy] 파싱 오류 (" + fpath + "): " + str(e))
+        full_path = base_path + path
+        biz_score, biz_cat, matched_kw = get_biz_score(full_path)
+        total_score = biz_score + 2
+        entry = {
+            "path":full_path,"method":method.upper(),
+            "summary":operation.get("summary",""),"tags":operation.get("tags",[]),
+            "biz_category":biz_cat,"biz_score":biz_score,"matched_kw":matched_kw,
+            "is_public":True,"total_score":total_score,
+            "params":[p.get("name","") for p in (operation.get("parameters") or [])],
+            "auth_required":"security" in operation or "security" in spec
+        }
+        endpoints.append(entry)
+        summary["total"] += 1
+        summary["by_category"][biz_cat] = summary["by_category"].get(biz_cat,0)+1
+        summary["by_method"][method.upper()] = summary["by_method"].get(method.upper(),0)+1
+        if total_score >= 5:
+            summary["high_risk"].append(full_path+" ["+method.upper()+"] score="+str(total_score))
 
-    log.info("[Trivy]  " + str(len(vulns)) + "개 파싱")
-    return vulns
-
-
-def parse_npm() -> list:
-    vulns = []
-    sev_map = {
-        "critical": "CRITICAL", "high": "HIGH",
-        "moderate": "MEDIUM",   "medium": "MEDIUM",
-        "low": "LOW",           "info": "LOW"
-    }
-    files = [p("npm-audit-root.json"), p("npm-audit-frontend.json")]
-    for fpath in files:
-        if not os.path.exists(fpath):
+SERVER_FILE = WS + "/src/server.ts"
+if os.path.exists(SERVER_FILE):
+    with open(SERVER_FILE, encoding="utf-8", errors="replace") as f:
+        content = f.read()
+    patterns = re.findall("app\\\\.(get|post|put|patch|delete)\\\\s*\\\\(\\\\s*[\'\\"]([^\'\\"]+)[\'\\"]", content)
+    server_count = 0
+    for method, path in patterns:
+        if any(ep["path"]==path and ep["method"]==method.upper() for ep in endpoints):
             continue
-        try:
-            with open(fpath, encoding="utf-8", errors="replace") as f:
-                data = json.load(f)
-            for pkg_name, info in (data.get("vulnerabilities") or {}).items():
-                sev = sev_map.get(info.get("severity", "").lower(), "LOW")
-                cve  = ""
-                cvss = None
-                for via in (info.get("via") or []):
-                    if isinstance(via, dict):
-                        cve = via.get("cve", "") or ""
-                        raw = float((via.get("cvss") or {}).get("score") or 0)
-                        if raw > 0:
-                            cvss = raw
-                        if cve:
-                            break
-                vulns.append({
-                    "tool": "npm", "cve": cve,
-                    "severity": sev, "package": pkg_name, "cvss": cvss
-                })
-        except Exception as e:
-            log.error("[npm] 파싱 오류 (" + fpath + "): " + str(e))
+        biz_score, biz_cat, matched_kw = get_biz_score(path)
+        total_score = biz_score + 2
+        endpoints.append({
+            "path":path,"method":method.upper(),"summary":"","tags":[],
+            "biz_category":biz_cat,"biz_score":biz_score,"matched_kw":matched_kw,
+            "is_public":True,"total_score":total_score,"params":[],"auth_required":False,"source":"server.ts"
+        })
+        summary["total"] += 1
+        summary["by_category"][biz_cat] = summary["by_category"].get(biz_cat,0)+1
+        summary["by_method"][method.upper()] = summary["by_method"].get(method.upper(),0)+1
+        if total_score >= 5:
+            summary["high_risk"].append(path+" ["+method.upper()+"] score="+str(total_score)+" (server.ts)")
+        server_count += 1
+    print("[server.ts] " + str(server_count) + " routes added")
 
-    log.info("[npm]    " + str(len(vulns)) + "개 파싱")
-    return vulns
-
-
-def parse_owasp() -> list:
-    vulns = []
-    fpath = p("dependency-check-report.json")
-    if not os.path.exists(fpath):
-        log.warning("[OWASP]  파일 없음: " + fpath)
-        return vulns
-    try:
-        with open(fpath, encoding="utf-8", errors="replace") as f:
-            data = json.load(f)
-
-        sev_map = {
-            "CRITICAL": "CRITICAL", "HIGH": "HIGH",
-            "MEDIUM": "MEDIUM",     "MODERATE": "MEDIUM",
-            "LOW": "LOW",           "INFO": "LOW"
+endpoints.sort(key=lambda x: x["total_score"], reverse=True)
+with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+    json.dump({"endpoints":endpoints,"summary":summary}, f, indent=2, ensure_ascii=False)
+print("total endpoints=" + str(summary["total"]))
+print("high_risk count=" + str(len(summary["high_risk"])))
+'''
+                        sh "python3 ${WORKSPACE}/output/parse_swagger.py"
+                    }
+                }
+            }
         }
-        for dep in data.get("dependencies", []):
-            pkg = dep.get("fileName", "unknown")
-            for vuln in dep.get("vulnerabilities", []):
-                vid  = vuln.get("name", "")
-                sev  = sev_map.get(vuln.get("severity", "").upper(), "LOW")
-                cvss = None
-                try:
-                    raw = float(
-                        vuln.get("cvssv3", {}).get("baseScore")
-                        or vuln.get("cvssv2", {}).get("score")
-                        or 0
-                    )
-                    if raw > 0:
-                        cvss = raw
-                except Exception:
-                    pass
-                vulns.append({
-                    "tool": "owasp", "cve": vid,
-                    "severity": sev, "package": pkg, "cvss": cvss
-                })
-    except Exception as e:
-        log.error("[OWASP]  파싱 오류: " + str(e))
 
-    log.info("[OWASP]  " + str(len(vulns)) + "개 파싱")
-    return vulns
+        stage('7. Business Context Analysis') {
+            steps {
+                dir("${WORKSPACE}/src") {
+                    script {
 
+                        def businessKeywords = [
+                            payment  : [score: 5, keywords: ['pay', 'payment', 'checkout', 'purchase', 'billing',
+                                                              'charge', 'refund', 'transaction', 'pg', 'card', 'bank',
+                                                              'stripe', 'braintree', 'paypal', 'invoice', 'receipt',
+                                                              'order', 'orders']],
+                            auth     : [score: 4, keywords: ['auth', 'jwt', 'jsonwebtoken', 'token', 'oauth',
+                                                              'passport', 'session', 'credential', 'login', 'saml',
+                                                              'bcrypt', 'argon', 'scrypt', 'otplib', 'speakeasy',
+                                                              'cookie', 'csrf', 'cors']],
+                            admin    : [score: 4, keywords: ['admin', 'manager', 'dashboard', 'console',
+                                                              'superuser', 'root', 'system', 'config', 'setting']],
+                            inventory: [score: 4, keywords: ['price', 'stock', 'inventory', 'quantity',
+                                                              'product-edit', 'update-price', 'discount']],
+                            sandbox  : [score: 4, keywords: ['vm2', 'sandbox', 'serialize', 'deserializ',
+                                                              'template', 'handlebars', 'pug', 'ejs', 'nunjucks',
+                                                              'lodash', 'underscore', 'eval', 'expression',
+                                                              'notevil', 'safe-eval', 'isolated-vm']],
+                            personal : [score: 3, keywords: ['user', 'profile', 'personal', 'privacy', 'email',
+                                                              'phone', 'address', 'delivery', 'shipping', 'ssn',
+                                                              'kyc', 'user-info', 'pii', 'gdpr']],
+                            coupon   : [score: 3, keywords: ['coupon', 'point', 'voucher', 'reward',
+                                                              'promo', 'discount-code']],
+                            security : [score: 3, keywords: ['sanitize', 'sanitize-html', 'xss', 'escape',
+                                                              'helmet', 'validator', 'dompurify', 'marked',
+                                                              'sql', 'inject']],
+                            product  : [score: 1, keywords: ['product', 'item', 'catalog', 'search',
+                                                              'list', 'category']]
+                        ]
 
-def parse_semgrep() -> list:
-    vulns = []
-    fpath = p("semgrep-result.json")
-    if not os.path.exists(fpath):
-        log.warning("[Semgrep] 파일 없음: " + fpath)
-        return vulns
-    try:
-        with open(fpath, encoding="utf-8", errors="replace") as f:
-            data = json.load(f)
+                        def categoryOrder = ['payment','auth','admin','inventory','sandbox',
+                                             'personal','coupon','security','product']
 
-        sev_map = {
-            "ERROR":   "HIGH",
-            "WARNING": "MEDIUM",
-            "INFO":    "LOW"
+                        def TRUST_WEIGHTS = [1.0, 1.0, 1.15, 1.30]
+                        def MAX_RAW       = 96.0
+
+                        def publicRoutes    = []
+                        def semgrepFindings = []
+
+                        if (fileExists("${WORKSPACE}/output/semgrep-result.json")) {
+                            def semgrepJson = readJSON file: "${WORKSPACE}/output/semgrep-result.json"
+                            semgrepJson.results?.each { finding ->
+                                def msg  = finding.extra?.message?.toLowerCase() ?: ''
+                                def rule = finding.check_id?.toLowerCase() ?: ''
+                                def file = finding.path?.toLowerCase() ?: ''
+                                semgrepFindings.add([file: finding.path, rule: rule, message: msg])
+                                if (msg.contains('/api/') || msg.contains('/rest/') ||
+                                    file.contains('route') || file.contains('router') ||
+                                    rule.contains('route') || rule.contains('express')) {
+                                    publicRoutes.add(msg)
+                                }
+                            }
+                            echo "Semgrep routes: ${publicRoutes.size()}"
+                        }
+
+                        def swaggerEndpoints   = []
+                        def swaggerPublicPaths = []
+                        if (fileExists("${WORKSPACE}/output/swagger-analysis.json")) {
+                            def swaggerJson = readJSON file: "${WORKSPACE}/output/swagger-analysis.json"
+                            swaggerEndpoints = swaggerJson.endpoints ?: []
+                            swaggerEndpoints.each { ep -> swaggerPublicPaths.add(ep.path?.toLowerCase() ?: '') }
+                            echo "Swagger endpoints: ${swaggerEndpoints.size()}"
+                        }
+
+                        def vulnBusinessScores = []
+
+                        def sourceFiles = fileExists("${WORKSPACE}/output/merged_vulns.json")
+                            ? ["${WORKSPACE}/output/merged_vulns.json"]
+                            : ["${WORKSPACE}/output/trivy-result.json",
+                               "${WORKSPACE}/output/trivy-frontend-result.json"]
+
+                        sourceFiles.each { filePath ->
+                            if (!fileExists(filePath)) return
+                            def vulnList = []
+
+                            if (filePath.contains("merged_vulns")) {
+                                vulnList = readJSON file: filePath
+                            } else {
+                                def trivyJson = readJSON file: filePath
+                                trivyJson.Results?.each { result ->
+                                    result.Vulnerabilities?.each { v ->
+                                        def cvss = 0.0
+                                        if (v.CVSS) {
+                                            ['nvd','ghsa','redhat'].each { src ->
+                                                if (v.CVSS[src] && cvss == 0.0) {
+                                                    def v3 = v.CVSS[src]?.V3Score
+                                                    def v2 = v.CVSS[src]?.V2Score
+                                                    if (v3 != null) cvss = v3 as double
+                                                    else if (v2 != null) cvss = v2 as double
+                                                }
+                                            }
+                                        }
+                                        if (cvss == 0.0) cvss = v.Severity == 'CRITICAL' ? 9.0 : 7.0
+                                        vulnList.add([vuln_id:v.VulnerabilityID?:'', package:v.PkgName?:'',
+                                            version:v.InstalledVersion?:'', severity:v.Severity?:'',
+                                            cvss:cvss, source:'trivy', source_count:1])
+                                    }
+                                }
+                            }
+
+                            vulnList.each { vuln ->
+                                def rawCvss   = vuln.cvss
+                                def cvssScore = 0.0
+                                try {
+                                    if (rawCvss != null && !(rawCvss instanceof net.sf.json.JSONNull))
+                                        cvssScore = rawCvss as double
+                                } catch (Exception e) { cvssScore = 0.0 }
+                                if (cvssScore == 0.0)
+                                    cvssScore = (vuln.severity == 'CRITICAL') ? 9.0 : 7.0
+
+                                def pkgName     = (vuln.package ?: '').toLowerCase()
+                                def bizScore    = 0
+                                def bizCategory = 'internal'
+                                def matchedKw   = ''
+
+                                for (int ci = 0; ci < categoryOrder.size(); ci++) {
+                                    if (bizScore > 0) break
+                                    def cat    = categoryOrder[ci]
+                                    def config = businessKeywords[cat]
+                                    for (int ki = 0; ki < config.keywords.size(); ki++) {
+                                        def kw = config.keywords[ki]
+                                        if (kw.length() >= 3 && pkgName.contains(kw)) {
+                                            bizScore = config.score; bizCategory = cat; matchedKw = kw; break
+                                        }
+                                    }
+                                }
+
+                                if (publicRoutes.any { r -> r.contains(pkgName) } ||
+                                    swaggerPublicPaths.any { pt -> pt.contains(pkgName) }) bizScore += 2
+
+                                def swaggerBonus = 0
+                                swaggerEndpoints.each { ep ->
+                                    def epPath = (ep.path ?: '').toLowerCase()
+                                    if (pkgName.length() >= 4 && epPath.contains(pkgName)) {
+                                        def epBiz = (ep.biz_score != null) ? (ep.biz_score as int) : 0
+                                        if (epBiz > swaggerBonus) swaggerBonus = epBiz
+                                    }
+                                }
+                                if (swaggerBonus > bizScore) { bizScore = swaggerBonus; bizCategory = 'swagger-mapped' }
+
+                                def reachability = 1.0
+                                if (pkgName.length() >= 4 && semgrepFindings.any { f ->
+                                    f.message?.contains(pkgName) || f.rule?.contains(pkgName) || f.file?.contains(pkgName)
+                                }) reachability = 1.5
+
+                                def srcCount    = (vuln.source_count != null) ? (vuln.source_count as int) : 1
+                                def trustWeight = TRUST_WEIGHTS[Math.min(srcCount, TRUST_WEIGHTS.size()-1)] as double
+                                def effectiveBiz = bizScore > 0 ? bizScore : 1
+                                def rawScore     = cvssScore * reachability * effectiveBiz * trustWeight
+                                def finalScore   = (rawScore / MAX_RAW) * 20.0
+                                def gate = finalScore >= 14.0 ? 'Block' : finalScore >= 8.0 ? 'Warn' : 'Pass'
+
+                                vulnBusinessScores.add([
+                                    pkg:vuln.package?:'', version:vuln.version?:'', cve:vuln.vuln_id?:'',
+                                    severity:vuln.severity?:'', cvss:cvssScore, bizCategory:bizCategory,
+                                    bizScore:bizScore, matchedKw:matchedKw, reachability:reachability,
+                                    trustWeight:trustWeight, sourceCount:srcCount, rawScore:rawScore,
+                                    finalScore:finalScore, gate:gate, source:vuln.source?:''
+                                ])
+                            }
+                        }
+
+                        def n = vulnBusinessScores.size()
+                        for (int i = 0; i < n-1; i++)
+                            for (int j = 0; j < n-i-1; j++)
+                                if ((vulnBusinessScores[j].finalScore as double) < (vulnBusinessScores[j+1].finalScore as double)) {
+                                    def tmp = vulnBusinessScores[j]
+                                    vulnBusinessScores[j] = vulnBusinessScores[j+1]
+                                    vulnBusinessScores[j+1] = tmp
+                                }
+
+                        def top10 = vulnBusinessScores.take(10)
+                        echo "====== TOP 10 ======"
+                        top10.eachWithIndex { v, i ->
+                            echo "${i+1}. ${v.cve} | ${v.pkg}@${v.version} | CVSS:${v.cvss} | ${v.bizCategory}(+${v.bizScore}) | final:${String.format('%.2f',v.finalScore as double)}/20 | ${v.gate}"
+                        }
+
+                        def blockCount = vulnBusinessScores.count { (it.finalScore as double) >= 14.0 }
+                        def warnCount  = vulnBusinessScores.count { s -> def f = s.finalScore as double; f >= 8.0 && f < 14.0 }
+                        def passCount  = vulnBusinessScores.count { (it.finalScore as double) < 8.0 }
+                        echo "Block:${blockCount} Warn:${warnCount} Pass:${passCount}"
+
+                        writeJSON file: "${WORKSPACE}/output/business-risk-result.json", json: vulnBusinessScores
+                        echo "Business Context Analysis done"
+                    }
+                }
+            }
         }
-        for finding in data.get("results", []):
-            sev_raw = (finding.get("extra", {}).get("severity") or "INFO").upper()
-            sev     = sev_map.get(sev_raw, "LOW")
-            pkg     = finding.get("path", "unknown")
-            rule    = finding.get("check_id", "")
-            vulns.append({
-                "tool": "semgrep", "cve": rule,
-                "severity": sev, "package": pkg, "cvss": None
-            })
-    except Exception as e:
-        log.error("[Semgrep] 파싱 오류: " + str(e))
 
-    log.info("[Semgrep] " + str(len(vulns)) + "개 파싱")
-    return vulns
+        stage('8. Risk Scoring & Gate') {
+            steps {
+                script {
+                    def semgrepCount = 0, mergedHigh = 0, mergedCrit = 0
+                    def maxFinal = 0.0, blockCount = 0, warnCount = 0
 
+                    if (fileExists("${WORKSPACE}/output/semgrep-result.json")) {
+                        def semJson = readJSON file: "${WORKSPACE}/output/semgrep-result.json"
+                        semgrepCount = semJson.results?.size() ?: 0
+                    }
 
-def load_merged_vulns() -> list:
-    fpath = p("merged_vulns.json")
-    if not os.path.exists(fpath):
-        log.warning("[Merged] 파일 없음: " + fpath)
-        return []
-    try:
-        with open(fpath, encoding="utf-8", errors="replace") as f:
-            return json.load(f)
-    except Exception as e:
-        log.error("[Merged] 로드 오류: " + str(e))
-        return []
+                    if (fileExists("${WORKSPACE}/output/merged_vulns.json")) {
+                        def mergedJson = readJSON file: "${WORKSPACE}/output/merged_vulns.json"
+                        mergedJson.each { v ->
+                            def sev = (v.severity ?: '').toUpperCase()
+                            if (sev == 'HIGH') mergedHigh++
+                            if (sev == 'CRITICAL') mergedCrit++
+                        }
+                    }
 
+                    if (fileExists("${WORKSPACE}/output/business-risk-result.json")) {
+                        def bizJson = readJSON file: "${WORKSPACE}/output/business-risk-result.json"
+                        bizJson.each { v ->
+                            def s = 0.0
+                            try {
+                                def raw = v.finalScore
+                                if (raw != null && !(raw instanceof net.sf.json.JSONNull))
+                                    s = raw as double
+                            } catch (Exception e) { s = 0.0 }
+                            if (s > maxFinal) maxFinal = s
+                            if (s >= 14.0) blockCount++
+                            else if (s >= 8.0) warnCount++
+                        }
+                    }
 
-def load_business_risk() -> list:
-    fpath = p("business-risk-result.json")
-    if not os.path.exists(fpath):
-        return []
-    try:
-        with open(fpath, encoding="utf-8", errors="replace") as f:
-            return json.load(f)
-    except Exception as e:
-        log.error("[BizRisk] 로드 오류: " + str(e))
-        return []
+                    def swaggerHR = 0
+                    if (fileExists("${WORKSPACE}/output/swagger-analysis.json")) {
+                        def swaggerJson = readJSON file: "${WORKSPACE}/output/swagger-analysis.json"
+                        swaggerHR = swaggerJson.summary?.high_risk?.size() ?: 0
+                    }
 
+                    def total = mergedHigh + mergedCrit
+                    def critR = total > 0 ? (mergedCrit / total as double) : 0.0
+                    def highR = total > 0 ? (mergedHigh  / total as double) : 0.0
+                    def base  = (critR * 100) + (highR * 40) + (semgrepCount * 0.2)
 
-def load_swagger_high_risk() -> int:
-    fpath = p("swagger-analysis.json")
-    if not os.path.exists(fpath):
-        return 0
-    try:
-        with open(fpath, encoding="utf-8", errors="replace") as f:
-            data = json.load(f)
-        return len(data.get("summary", {}).get("high_risk", []))
-    except Exception as e:
-        log.error("[Swagger] 로드 오류: " + str(e))
-        return 0
+                    // ── Security Gate 정책 (Base Score 기준) ──────────────────
+                    def baseGrade, baseAction, baseReason
+                    if (base >= 50.0) {
+                        baseGrade  = "HIGH RISK"
+                        baseAction = "BLOCK"
+                        baseReason = "Base score exceeded deployment threshold (>= 50)"
+                    } else if (base >= 30.0) {
+                        baseGrade  = "WARN"
+                        baseAction = "ALLOW"
+                        baseReason = "Elevated base score. Security review recommended."
+                    } else {
+                        baseGrade  = "PASS"
+                        baseAction = "ALLOW"
+                        baseReason = "Base score within acceptable range."
+                    }
 
+                    // ── Business Risk Gate ────────────────────────────────────
+                    def bizGrade, bizAction, bizReason
+                    if (blockCount > 0) {
+                        bizGrade  = "CRITICAL BLOCK"
+                        bizAction = "BLOCK"
+                        bizReason = "Business-critical vulnerability detected (finalScore >= 14/20)"
+                    } else if (warnCount > 0) {
+                        bizGrade  = "WARN"
+                        bizAction = "ALLOW"
+                        bizReason = "High business risk vulnerability detected (finalScore >= 8/20)"
+                    } else {
+                        bizGrade  = "PASS"
+                        bizAction = "ALLOW"
+                        bizReason = "Business risk within acceptable range."
+                    }
 
-def parse_attack_surface() -> dict:
-    attack_surface_map = {
-        "sql-injection"    : 0,
-        "xss"              : 0,
-        "path-traversal"   : 0,
-        "open-redirect"    : 0,
-        "code-injection"   : 0,
-        "hardcoded-secret" : 0,
-        "directory-listing": 0,
-        "other"            : 0
+                    echo "======================================================"
+                    echo "  [Base Score Gate]"
+                    echo "  Risk Score : ${String.format('%.1f', base)}/100"
+                    echo "  Status     : ${baseGrade}"
+                    echo "  Action     : ${baseAction}"
+                    echo "  Reason     : ${baseReason}"
+                    echo "------------------------------------------------------"
+                    echo "  [Business Risk Gate]"
+                    echo "  Max Score  : ${String.format('%.2f', maxFinal)}/20"
+                    echo "  Status     : ${bizGrade}"
+                    echo "  Action     : ${bizAction}"
+                    echo "  Reason     : ${bizReason}"
+                    echo "  Block:${blockCount} Warn:${warnCount}"
+                    echo "  Swagger High Risk Endpoints: ${swaggerHR}"
+                    echo "======================================================"
+
+                    if (bizAction == "BLOCK" || baseAction == "BLOCK") {
+                        currentBuild.result = 'FAILURE'
+                        echo "BLOCKED — Build failed due to security policy violation"
+                    } else if (baseGrade == "WARN" || bizGrade == "WARN") {
+                        currentBuild.result = 'UNSTABLE'
+                        echo "WARN — Security review required before release"
+                    } else {
+                        echo "PASS — All security gates passed"
+                    }
+                }
+            }
+        }
+
+        stage('9. Prometheus Push') {
+            steps {
+                script {
+                    def bizJson     = fileExists("${WORKSPACE}/output/business-risk-result.json")
+                        ? readJSON(file: "${WORKSPACE}/output/business-risk-result.json") : []
+                    def mergedJson  = fileExists("${WORKSPACE}/output/merged_vulns.json")
+                        ? readJSON(file: "${WORKSPACE}/output/merged_vulns.json") : []
+                    def semgrepJson = fileExists("${WORKSPACE}/output/semgrep-result.json")
+                        ? readJSON(file: "${WORKSPACE}/output/semgrep-result.json") : [results:[]]
+
+                    def crit=0, high=0, block=0, warn=0, maxS=0.0
+
+                    mergedJson.each { v ->
+                        def sev = (v.severity?:'').toUpperCase()
+                        if (sev=='CRITICAL') crit++
+                        if (sev=='HIGH') high++
+                    }
+                    bizJson.each { v ->
+                        def s = 0.0
+                        try {
+                            def raw = v.finalScore
+                            if (raw != null && !(raw instanceof net.sf.json.JSONNull))
+                                s = raw as double
+                        } catch (Exception e) { s = 0.0 }
+                        if (s > maxS) maxS = s
+                        if (s >= 14.0) block++
+                        else if (s >= 8.0) warn++
+                    }
+
+                    def sc   = semgrepJson.results?.size() ?: 0
+                    def tot  = crit + high
+                    def cR   = tot > 0 ? (crit/tot as double) : 0.0
+                    def hR   = tot > 0 ? (high/tot as double) : 0.0
+                    def base = (cR*100)+(hR*40)+(sc*0.2)
+
+                    def metrics = """# HELP trivy_pipe_risk_score Business Risk Score (20점 기준)
+# TYPE trivy_pipe_risk_score gauge
+trivy_pipe_risk_score ${String.format('%.2f',maxS)}
+# HELP trivy_pipe_base_score Base Score
+# TYPE trivy_pipe_base_score gauge
+trivy_pipe_base_score ${String.format('%.1f',base)}
+# HELP trivy_pipe_critical_count CRITICAL count
+# TYPE trivy_pipe_critical_count gauge
+trivy_pipe_critical_count ${crit}
+# HELP trivy_pipe_high_count HIGH count
+# TYPE trivy_pipe_high_count gauge
+trivy_pipe_high_count ${high}
+# HELP trivy_pipe_total_vulns total vulns
+# TYPE trivy_pipe_total_vulns gauge
+trivy_pipe_total_vulns ${mergedJson.size()}
+# HELP trivy_pipe_block_count block count
+# TYPE trivy_pipe_block_count gauge
+trivy_pipe_block_count ${block}
+# HELP trivy_pipe_warn_count warn count
+# TYPE trivy_pipe_warn_count gauge
+trivy_pipe_warn_count ${warn}
+# HELP trivy_pipe_semgrep_count semgrep count
+# TYPE trivy_pipe_semgrep_count gauge
+trivy_pipe_semgrep_count ${sc}
+# HELP trivy_pipe_build_status build status (1=pass, 0=fail)
+# TYPE trivy_pipe_build_status gauge
+trivy_pipe_build_status ${block > 0 || base >= 50.0 ? 0 : 1}
+"""
+                    writeFile file: "${WORKSPACE}/output/metrics.txt", text: metrics
+                    sh """
+                        curl -s -X POST \\
+                            http://pushgateway:9091/metrics/job/trivy-pipe/instance/juice-shop \\
+                            --data-binary @${WORKSPACE}/output/metrics.txt \\
+                        && echo "Prometheus push OK" || echo "Prometheus push FAILED"
+                    """
+                }
+            }
+        }
+
+        stage('10. Security Metrics Push') {
+            steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    script {
+                        sh """
+                            if ! python3 -c "import prometheus_client" 2>/dev/null; then
+                                apt-get update -qq 2>/dev/null || true
+                                apt-get install -y -q python3-pip 2>/dev/null || true
+                                python3 -m pip install prometheus_client --break-system-packages -q
+                            fi
+                            cp ${WORKSPACE}/security_metrics.py ${WORKSPACE}/output/security_metrics.py
+                            WORKSPACE=${WORKSPACE} PUSHGATEWAY_URL=pushgateway:9091 \\
+                                python3 ${WORKSPACE}/output/security_metrics.py
+                        """
+                    }
+                }
+            }
+        }
+
+    } // end stages
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'output/**', allowEmptyArchive: true
+            script {
+                if (fileExists('output/dependency-check-report.xml'))
+                    dependencyCheckPublisher pattern: 'output/dependency-check-report.xml'
+                else
+                    echo "OWASP report missing - skip publisher"
+            }
+            echo "Result: ${currentBuild.currentResult}"
+        }
+        success { echo "✅ Pipeline SUCCESS — All security gates passed" }
+        failure { echo "❌ Pipeline FAILURE — Security policy violation detected" }
+        unstable { echo "⚠️ Pipeline UNSTABLE — Security review required" }
     }
-    fpath = p("semgrep-result.json")
-    if not os.path.exists(fpath):
-        return attack_surface_map
-    try:
-        with open(fpath, encoding="utf-8", errors="replace") as f:
-            data = json.load(f)
-        for finding in data.get("results", []):
-            rule = (finding.get("check_id") or "").lower()
-            if "sql" in rule or "injection" in rule or "sequelize" in rule:
-                attack_surface_map["sql-injection"] += 1
-            elif "xss" in rule or "html-format" in rule or "raw-html" in rule:
-                attack_surface_map["xss"] += 1
-            elif "path" in rule or "traversal" in rule or "sendfile" in rule:
-                attack_surface_map["path-traversal"] += 1
-            elif "redirect" in rule:
-                attack_surface_map["open-redirect"] += 1
-            elif "code" in rule or "eval" in rule or "string-concat" in rule:
-                attack_surface_map["code-injection"] += 1
-            elif "secret" in rule or "hardcode" in rule or "jwt" in rule:
-                attack_surface_map["hardcoded-secret"] += 1
-            elif "directory" in rule or "listing" in rule:
-                attack_surface_map["directory-listing"] += 1
-            else:
-                attack_surface_map["other"] += 1
-    except Exception as e:
-        log.error("[공격 표면] 파싱 오류: " + str(e))
-    log.info("[공격 표면] " + str(attack_surface_map))
-    return attack_surface_map
-
-
-def calc_vuln_change(by_sev: dict) -> dict:
-    prev_file = p("prev_metrics.json")
-    prev_data = {}
-    if os.path.exists(prev_file):
-        try:
-            with open(prev_file, encoding="utf-8", errors="replace") as f:
-                prev_data = json.load(f)
-        except Exception:
-            pass
-
-    changes = {
-        "CRITICAL": by_sev.get("CRITICAL", 0) - prev_data.get("CRITICAL", 0),
-        "HIGH"    : by_sev.get("HIGH",     0) - prev_data.get("HIGH",     0),
-        "MEDIUM"  : by_sev.get("MEDIUM",   0) - prev_data.get("MEDIUM",   0),
-        "LOW"     : by_sev.get("LOW",      0) - prev_data.get("LOW",      0),
-    }
-    try:
-        with open(prev_file, "w", encoding="utf-8") as f:
-            json.dump({k: by_sev.get(k, 0) for k in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]}, f)
-    except Exception as e:
-        log.error("[변화율] 저장 오류: " + str(e))
-    log.info("[변화율] " + str(changes))
-    return changes
-
-
-def aggregate(all_vulns: list) -> dict:
-    by_severity = defaultdict(int)
-    by_tool     = defaultdict(int)
-    pkg_scores  = defaultdict(lambda: {"score": 0.0, "cve": "", "severity": "LOW"})
-
-    for v in all_vulns:
-        sev  = v["severity"]
-        tool = v["tool"]
-        pkg  = v["package"]
-        cve  = v["cve"]
-
-        by_severity[sev] += 1
-        by_tool[tool]    += 1
-
-        score = cvss_for_score(v)
-        if score > pkg_scores[pkg]["score"]:
-            pkg_scores[pkg] = {"score": score, "cve": cve, "severity": sev}
-
-    all_packages = sorted(
-        [{"package": k, **v} for k, v in pkg_scores.items()],
-        key=lambda x: x["score"],
-        reverse=True
-    )
-
-    return {
-        "total"         : len(all_vulns),
-        "by_severity"   : dict(by_severity),
-        "by_tool"       : dict(by_tool),
-        "top10_packages": all_packages,
-    }
-
-
-def calc_risk_score(agg: dict, semgrep_count: int, swagger_high_risk: int = 0,
-                    biz_scores: list = None) -> dict:
-    by_sev = agg["by_severity"]
-    c = by_sev.get("CRITICAL", 0)
-    h = by_sev.get("HIGH",     0)
-    m = by_sev.get("MEDIUM",   0)
-
-    if biz_scores:
-        sorted_scores = sorted(
-            [float(v.get("finalScore", 0)) for v in biz_scores],
-            reverse=True
-        )
-        top3     = sorted_scores[:3]
-        top3_avg = sum(top3) / len(top3) if top3 else 0.0
-    else:
-        top3_avg = 0.0
-
-    quality_score  = min((top3_avg / 20.0) * 70.0, 70.0)
-    vuln_scale     = (c * 1.0) + (h * 0.2) + (m * 0.05)
-    endpoint_scale = swagger_high_risk * 0.3
-    scale_score    = min(vuln_scale + endpoint_scale, 30.0)
-    risk_score     = min(quality_score + scale_score, 100.0)
-
-    # ── 차단 기준: 60점 이상 BLOCK, 35점 이상 WARN ──
-    if risk_score >= 60:
-        grade = "BLOCK"
-    elif risk_score >= 35:
-        grade = "WARN"
-    else:
-        grade = "PASS"
-
-    log.info("[Risk Score] " + str(round(risk_score, 1)) + "/100점 → " + grade)
-    return {
-        "risk_score"    : round(risk_score, 1),
-        "quality_score" : round(quality_score, 1),
-        "scale_score"   : round(scale_score, 1),
-        "top3_avg"      : round(top3_avg, 2),
-        "critical_score": round(c * 1.0, 1),
-        "high_score"    : round(h * 0.2, 1),
-        "semgrep_score" : 0.0,
-        "grade"         : grade,
-    }
-
-
-def calc_confidence(merged: list) -> dict:
-    counts = {"single": 0, "double": 0, "triple": 0}
-    for v in merged:
-        sc = v.get("source_count", 1)
-        if sc >= 3:
-            counts["triple"] += 1
-        elif sc == 2:
-            counts["double"] += 1
-        else:
-            counts["single"] += 1
-    return counts
-
-
-def push_metrics(agg, risk, confidence, top10, build_status,
-                 attack_surface, vuln_change,
-                 total_raw=0, swagger_high_risk=0, merged_vulns=None):
-    registry = CollectorRegistry()
-
-    Gauge("supplychain_risk_score", "공급망 보안 위험 점수 (0~100점)", registry=registry).set(risk["risk_score"])
-    Gauge("build_status", "빌드 결과 (1=성공, 0=실패)", registry=registry).set(build_status)
-    Gauge("total_vulnerability_count", "전체 취약점 수 (중복 포함)", registry=registry).set(total_raw or agg["total"])
-
-    g_sev = Gauge("vulnerability_count", "severity별 취약점 수", ["severity"], registry=registry)
-    for sev in SEV_LIST:
-        g_sev.labels(severity=sev.lower()).set(agg["by_severity"].get(sev, 0))
-
-    g_tool = Gauge("tool_detection_count", "도구별 탐지 수", ["tool"], registry=registry)
-    for tool in ["trivy", "npm", "owasp", "semgrep"]:
-        g_tool.labels(tool=tool).set(agg["by_tool"].get(tool, 0))
-
-    g_comp = Gauge("risk_component_score", "Risk Score 구성 요소별 기여도", ["component"], registry=registry)
-    g_comp.labels(component="quality").set(risk["quality_score"])
-    g_comp.labels(component="scale").set(risk["scale_score"])
-    g_comp.labels(component="top3_avg").set(risk["top3_avg"])
-
-    g_raw = Gauge("raw_detection_count", "원본 탐지 수치", ["type"], registry=registry)
-    for t, k in [("critical", "CRITICAL"), ("high", "HIGH"), ("medium", "MEDIUM"), ("low", "LOW")]:
-        g_raw.labels(type=t).set(agg["by_severity"].get(k, 0))
-    g_raw.labels(type="semgrep").set(agg["by_tool"].get("semgrep", 0))
-    g_raw.labels(type="endpoint_high_risk").set(swagger_high_risk)
-
-    g_pkg = Gauge("package_risk_score", "패키지별 위험 점수", ["package", "cve", "severity"], registry=registry)
-    for item in top10:
-        pkg = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(item["package"])[:60]) or "unknown"
-        cve = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(item["cve"])[:60]) if item["cve"] else "N_A"
-        sev = item.get("severity", "UNKNOWN").upper()
-        sev = sev if sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"] else "UNKNOWN"
-        g_pkg.labels(package=pkg, cve=cve, severity=sev).set(item["score"])
-
-    if merged_vulns:
-        g_vuln = Gauge("vuln_detail_score", "CVE별 전체 취약점 목록",
-                       ["vuln_id", "package", "severity", "source"], registry=registry)
-        for v in merged_vulns:
-            vid      = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("vuln_id", "N/A"))[:80]) or "N_A"
-            pkg      = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("package", "unknown"))[:60]) or "unknown"
-            sev      = v.get("severity", "LOW").upper()
-            src      = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("source", "unknown"))[:30]) or "unknown"
-            sev      = sev if sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"] else "UNKNOWN"
-            cvss_val = safe_cvss(v)
-            g_vuln.labels(vuln_id=vid, package=pkg, severity=sev, source=src).set(
-                cvss_val if cvss_val is not None else -1
-            )
-        log.info("[CVE 전체 목록] " + str(len(merged_vulns)) + "개 전송")
-
-    g_conf = Gauge("vulnerability_confidence_count", "탐지 신뢰도별 취약점 수", ["confidence"], registry=registry)
-    for level in ["single", "double", "triple"]:
-        g_conf.labels(confidence=level).set(confidence[level])
-
-    g_attack = Gauge("attack_surface_count", "Semgrep 공격 표면 유형별", ["type"], registry=registry)
-    for t, cnt in attack_surface.items():
-        g_attack.labels(type=t).set(cnt)
-
-    g_change = Gauge("vuln_change_count", "이전 빌드 대비 변화", ["severity"], registry=registry)
-    for sev, change in vuln_change.items():
-        g_change.labels(severity=sev.lower()).set(change)
-
-    try:
-        push_to_gateway(PUSHGATEWAY_URL, job=JOB_NAME, registry=registry)
-        log.info("Pushgateway 전송 완료 → " + PUSHGATEWAY_URL)
-    except Exception as e:
-        log.error("Pushgateway 전송 실패: " + str(e))
-
-
-def main():
-    log.info("=" * 60)
-    log.info("  보안 결과 집계 + Prometheus Pushgateway 전송 시작")
-    log.info("=" * 60)
-
-    trivy_vulns       = parse_trivy()
-    npm_vulns         = parse_npm()
-    owasp_vulns       = parse_owasp()
-    semgrep_vulns     = parse_semgrep()
-    merged_vulns      = load_merged_vulns()
-    biz_risk          = load_business_risk()
-    swagger_high_risk = load_swagger_high_risk()
-    semgrep_count     = len(semgrep_vulns)
-
-    all_vulns = trivy_vulns + npm_vulns + owasp_vulns + semgrep_vulns
-    agg_all   = aggregate(all_vulns)
-
-    if merged_vulns:
-        merged_for_score = []
-        for v in merged_vulns:
-            sev = v.get("severity", "LOW").upper()
-            merged_for_score.append({
-                "tool"    : v.get("source", "merged"),
-                "cve"     : v.get("vuln_id", ""),
-                "severity": sev,
-                "package" : v.get("package", "unknown"),
-                "cvss"    : safe_cvss(v),
-            })
-        agg = aggregate(merged_for_score)
-    else:
-        agg = agg_all
-
-    agg["by_tool"] = agg_all["by_tool"]
-
-    risk = calc_risk_score(agg=agg, semgrep_count=semgrep_count,
-                           swagger_high_risk=swagger_high_risk, biz_scores=biz_risk)
-
-    confidence     = calc_confidence(merged_vulns) if merged_vulns else {"single": 0, "double": 0, "triple": 0}
-    attack_surface = parse_attack_surface()
-    vuln_change    = calc_vuln_change(agg["by_severity"])
-
-    block_count  = sum(1 for v in biz_risk if float(v.get("finalScore", 0)) >= 14.0)
-
-    # ── 차단 기준: 60점 이상 BLOCK ──
-    build_status = 0 if (risk["risk_score"] >= 60.0 or block_count > 0) else 1
-    log.info("[Build Status] " + ("FAIL" if build_status == 0 else "PASS") +
-             " (score=" + str(risk["risk_score"]) + ", grade=" + risk["grade"] + ")")
-
-    push_metrics(
-        agg=agg, risk=risk, confidence=confidence,
-        top10=agg["top10_packages"], build_status=build_status,
-        attack_surface=attack_surface, vuln_change=vuln_change,
-        total_raw=agg_all["total"], swagger_high_risk=swagger_high_risk,
-        merged_vulns=merged_vulns
-    )
-
-    log.info("=" * 60)
-    log.info("  완료")
-    log.info("=" * 60)
-
-
-if __name__ == "__main__":
-    main()
+}
