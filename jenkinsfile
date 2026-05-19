@@ -431,23 +431,23 @@ print("high_risk count=" + str(len(summary["high_risk"])))
                     script {
 
                         def businessKeywords = [
-                            payment  : [score: 5, keywords: ['pay', 'payment', 'checkout', 'purchase', 'billing',
+                            payment  : [score: 6, keywords: ['pay', 'payment', 'checkout', 'purchase', 'billing',
                                                               'charge', 'refund', 'transaction', 'pg', 'card', 'bank',
                                                               'stripe', 'braintree', 'paypal', 'invoice', 'receipt',
                                                               'order', 'orders']],
-                            auth     : [score: 4, keywords: ['auth', 'jwt', 'jsonwebtoken', 'token', 'oauth',
+                            auth     : [score: 5, keywords: ['auth', 'jwt', 'jsonwebtoken', 'token', 'oauth',
                                                               'passport', 'session', 'credential', 'login', 'saml',
                                                               'bcrypt', 'argon', 'scrypt', 'otplib', 'speakeasy',
                                                               'cookie', 'csrf', 'cors']],
-                            admin    : [score: 4, keywords: ['admin', 'manager', 'dashboard', 'console',
+                            admin    : [score: 5, keywords: ['admin', 'manager', 'dashboard', 'console',
                                                               'superuser', 'root', 'system', 'config', 'setting']],
                             inventory: [score: 4, keywords: ['price', 'stock', 'inventory', 'quantity',
                                                               'product-edit', 'update-price', 'discount']],
-                            sandbox  : [score: 4, keywords: ['vm2', 'sandbox', 'serialize', 'deserializ',
+                            sandbox  : [score: 5, keywords: ['vm2', 'sandbox', 'serialize', 'deserializ',
                                                               'template', 'handlebars', 'pug', 'ejs', 'nunjucks',
                                                               'lodash', 'underscore', 'eval', 'expression',
                                                               'notevil', 'safe-eval', 'isolated-vm']],
-                            personal : [score: 3, keywords: ['user', 'profile', 'personal', 'privacy', 'email',
+                            personal : [score: 4, keywords: ['user', 'profile', 'personal', 'privacy', 'email',
                                                               'phone', 'address', 'delivery', 'shipping', 'ssn',
                                                               'kyc', 'user-info', 'pii', 'gdpr']],
                             coupon   : [score: 3, keywords: ['coupon', 'point', 'voucher', 'reward',
@@ -455,7 +455,7 @@ print("high_risk count=" + str(len(summary["high_risk"])))
                             security : [score: 3, keywords: ['sanitize', 'sanitize-html', 'xss', 'escape',
                                                               'helmet', 'validator', 'dompurify', 'marked',
                                                               'sql', 'inject']],
-                            product  : [score: 1, keywords: ['product', 'item', 'catalog', 'search',
+                            product  : [score: 2, keywords: ['product', 'item', 'catalog', 'search',
                                                               'list', 'category']]
                         ]
 
@@ -576,9 +576,9 @@ print("high_risk count=" + str(len(summary["high_risk"])))
 
                                 def srcCount    = (vuln.source_count != null) ? (vuln.source_count as int) : 1
                                 def trustWeight = TRUST_WEIGHTS[Math.min(srcCount, TRUST_WEIGHTS.size()-1)] as double
-                                def effectiveBiz = bizScore > 0 ? bizScore : 1
+                                def effectiveBiz = bizScore > 0 ? bizScore : 2
                                 def rawScore     = cvssScore * reachability * effectiveBiz * trustWeight
-                                def finalScore   = (rawScore / MAX_RAW) * 20.0
+                                def finalScore   = Math.min((rawScore / MAX_RAW) * 20.0, 20.0)
                                 def gate = finalScore >= 14.0 ? 'Block' : finalScore >= 8.0 ? 'Warn' : 'Pass'
 
                                 vulnBusinessScores.add([
