@@ -23,7 +23,7 @@ pipeline {
         stage('2. Source Code Checkout') {
             steps {
                 dir("${WORKSPACE}/src") {
-                    git url: 'https://github.com/TryGhost/Ghost.git', branch: 'master'
+                    git url: 'https://github.com/TryGhost/Ghost.git', branch: 'main'
                     sh 'ls -la'
                 }
             }
