@@ -474,7 +474,7 @@ def push_metrics(agg, risk, confidence, top10, build_status,
             sev      = sev if sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"] else "UNKNOWN"
             cvss_val = safe_cvss(v)
             if cvss_val is None:
-                cvss_val = -1
+                cvss_val = 0  # Grafana 표에서 0으로 표시 (-1은 필터링 안됨)
 
             raw_vid  = str(v.get("vuln_id", "")).strip()
             biz      = biz_map.get(raw_vid)
