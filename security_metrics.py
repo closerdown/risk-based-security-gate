@@ -406,8 +406,30 @@ def calc_risk_score(agg: dict, semgrep_count: int, swagger_high_risk: int = 0,
             [float(v.get("finalScore", 0)) for v in biz_scores],
             reverse=True
         )
-        top3     = sorted_scores[:3]
-        top3_avg = sum(top3) / len(top3) if top3 else 0.0
+
+        # Block/Warn 분리
+        block_scores = sorted(
+            [float(v.get("finalScore", 0)) for v in biz_scores
+             if float(v.get("finalScore", 0)) >= 14.0],
+            reverse=True
+        )
+        warn_scores = sorted(
+            [float(v.get("finalScore", 0)) for v in biz_scores
+             if 8.0 <= float(v.get("finalScore", 0)) < 14.0],
+            reverse=True
+        )
+
+        if block_scores:
+            block_avg = sum(block_scores) / len(block_scores)
+            warn_avg  = sum(warn_scores[:3]) / min(len(warn_scores), 3) if warn_scores else 0.0
+            # Block 70% + Warn 30% 가중 평균
+            top_avg = block_avg * 0.7 + warn_avg * 0.3
+        elif warn_scores:
+            top_avg = sum(warn_scores[:3]) / min(len(warn_scores), 3)
+        else:
+            top_avg = sorted_scores[0] if sorted_scores else 0.0
+
+        top3_avg = top_avg
     else:
         top3_avg = 0.0
 
