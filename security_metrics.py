@@ -273,22 +273,23 @@ def load_swagger_high_risk() -> int:
 
 
 def load_cvss_comparison() -> dict:
+    """cvss-comparison.json 로드 — Prometheus push는 하지 않음, 로그 출력용"""
     fpath = p("cvss-comparison.json")
     if not os.path.exists(fpath):
-        log.warning("[CVSSComp] 파일 없음 — 스킵")
-        return {
-            "upgraded": [], "downgraded": [], "unknown": [],
-            "summary": {"upgraded_count": 0, "downgraded_count": 0, "unknown_count": 0}
-        }
+        return {"upgraded": [], "downgraded": [], "unknown": [],
+                "summary": {"upgraded_count": 0, "downgraded_count": 0, "unknown_count": 0}}
     try:
         with open(fpath, encoding="utf-8", errors="replace") as f:
-            return json.load(f)
+            data = json.load(f)
+        s = data.get("summary", {})
+        log.info("[CVSS 비교] 추가 탐지: " + str(s.get("upgraded_count", 0)) +
+                 "개 / 과잉 차단 방지: " + str(s.get("downgraded_count", 0)) +
+                 "개 / CVSS 없음: " + str(s.get("unknown_count", 0)) + "개")
+        return data
     except Exception as e:
         log.error("[CVSSComp] 로드 오류: " + str(e))
-        return {
-            "upgraded": [], "downgraded": [], "unknown": [],
-            "summary": {"upgraded_count": 0, "downgraded_count": 0, "unknown_count": 0}
-        }
+        return {"upgraded": [], "downgraded": [], "unknown": [],
+                "summary": {"upgraded_count": 0, "downgraded_count": 0, "unknown_count": 0}}
 
 
 def parse_attack_surface() -> dict:
@@ -463,7 +464,7 @@ def calc_confidence(merged: list) -> dict:
 def push_metrics(agg, risk, confidence, top10, build_status,
                  attack_surface, vuln_change,
                  total_raw=0, swagger_high_risk=0, merged_vulns=None,
-                 biz_scores=None, cvss_comparison=None):
+                 biz_scores=None):
     registry = CollectorRegistry()
 
     Gauge("supplychain_risk_score", "공급망 보안 위험 점수 (0~100점)", registry=registry).set(risk["risk_score"])
@@ -560,65 +561,6 @@ def push_metrics(agg, risk, confidence, top10, build_status,
     for sev, change in vuln_change.items():
         g_change.labels(severity=sev.lower()).set(change)
 
-    # ── CVSS vs Business Risk 비교 메트릭 ────────────────────────────────────
-    if cvss_comparison:
-        summary          = cvss_comparison.get("summary", {})
-        upgraded_count   = summary.get("upgraded_count", 0)
-        downgraded_count = summary.get("downgraded_count", 0)
-        unknown_count    = summary.get("unknown_count", 0)
-
-        Gauge("cvss_comparison_upgraded_count",
-              "CVSS로는 못 잡는데 Business Risk로 추가 Block한 취약점 수",
-              registry=registry).set(upgraded_count)
-        Gauge("cvss_comparison_downgraded_count",
-              "CVSS는 Block이나 Business Risk로 Pass 처리한 취약점 수",
-              registry=registry).set(downgraded_count)
-        Gauge("cvss_comparison_unknown_count",
-              "CVSS 없어 판단 불가 취약점 수",
-              registry=registry).set(unknown_count)
-
-        g_upgraded = Gauge("cvss_upgraded_detail",
-                           "CVSS 대비 Business Risk로 추가 탐지된 취약점 상세",
-                           ["vuln_id", "package", "cvss_gate", "biz_gate",
-                            "biz_category", "final_score", "connected_api", "cvss_source"],
-                           registry=registry)
-        for v in (cvss_comparison.get("upgraded") or []):
-            vid  = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("cve", "N/A"))[:80]) or "N_A"
-            pkg  = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("pkg", "unknown"))[:60]) or "unknown"
-            cat  = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("bizCat", "unknown"))[:30]) or "unknown"
-            csrc = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("cvss_source", "missing"))[:30]) or "missing"
-            apis = v.get("connectedApis", [])
-            conn = re.sub(r"[^a-zA-Z0-9_.:\-/]", "_", str(apis[0])[:80]) if apis else "-"
-            fs   = str(round(float(v.get("final", 0)), 2))
-            g_upgraded.labels(
-                vuln_id=vid, package=pkg,
-                cvss_gate=str(v.get("cvssGate", "")),
-                biz_gate=str(v.get("bizGate", "")),
-                biz_category=cat, final_score=fs,
-                connected_api=conn, cvss_source=csrc
-            ).set(float(v.get("cvss", 0) or 0))
-
-        g_downgraded = Gauge("cvss_downgraded_detail",
-                             "CVSS Block → Business Risk Pass 상세",
-                             ["vuln_id", "package", "cvss_gate", "biz_gate",
-                              "biz_category", "final_score", "cvss_source"],
-                             registry=registry)
-        for v in (cvss_comparison.get("downgraded") or []):
-            vid  = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("cve", "N/A"))[:80]) or "N_A"
-            pkg  = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("pkg", "unknown"))[:60]) or "unknown"
-            cat  = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("bizCat", "unknown"))[:30]) or "unknown"
-            csrc = re.sub(r"[^a-zA-Z0-9_.:\-]", "_", str(v.get("cvss_source", "missing"))[:30]) or "missing"
-            fs   = str(round(float(v.get("final", 0)), 2))
-            g_downgraded.labels(
-                vuln_id=vid, package=pkg,
-                cvss_gate=str(v.get("cvssGate", "")),
-                biz_gate=str(v.get("bizGate", "")),
-                biz_category=cat, final_score=fs, cvss_source=csrc
-            ).set(float(v.get("cvss", 0) or 0))
-
-        log.info("[CVSS 비교] 추가 탐지: " + str(upgraded_count) +
-                 "개 / 과잉 차단 방지: " + str(downgraded_count) +
-                 "개 / CVSS 없음: " + str(unknown_count) + "개")
 
     try:
         push_to_gateway(PUSHGATEWAY_URL, job=JOB_NAME, registry=registry)
@@ -687,8 +629,7 @@ def main():
         top10=agg["top10_packages"], build_status=build_status,
         attack_surface=attack_surface, vuln_change=vuln_change,
         total_raw=agg_all["total"], swagger_high_risk=swagger_high_risk,
-        merged_vulns=merged_vulns, biz_scores=biz_risk,
-        cvss_comparison=cvss_comparison
+        merged_vulns=merged_vulns, biz_scores=biz_risk
     )
 
     log.info("=" * 60)
