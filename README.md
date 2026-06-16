@@ -10,11 +10,15 @@
 
 본 프로젝트는 이러한 한계를 개선하기 위해 취약점 정보를 수집하고, 서비스 맥락을 반영한 위험도 산정 모델을 적용하여 Jenkins CI/CD 환경에서 자동 보안 검증이 가능하도록 구현하였습니다.
 
+<br>
+
 ---
 
 ## 🤝 프로젝트 형태
 
 **Team Project (5인)**
+
+<br>
 
 ---
 
@@ -28,13 +32,19 @@
 - Jenkins Security Gate
 - Grafana Dashboard 시각화
 
+<br>
+
 ---
 
 ## 🏗️ System Architecture
 
+프로젝트는 SAST 결과 수집, Security Metrics 계산, Risk Score 산정, Jenkins Security Gate 및 Grafana 시각화까지 하나의 파이프라인으로 구성하였습니다.
+
+<br>
+
 <img width="751" height="450" alt="image" src="https://github.com/user-attachments/assets/2e9af83f-c41c-419e-a009-591feb574ec2" />
 
-프로젝트는 SAST 결과 수집, Security Metrics 계산, Risk Score 산정, Jenkins Security Gate 및 Grafana 시각화까지 하나의 파이프라인으로 구성하였습니다.
+<br>
 
 ---
 
@@ -44,13 +54,19 @@
 
 이를 통해 단순 취약점 개수가 아닌 실제 영향도가 높은 기능 영역을 식별할 수 있도록 구현하였습니다.
 
+<br>
+
 <img width="748" height="479" alt="image" src="https://github.com/user-attachments/assets/7c8ddef7-9e28-44e9-a537-7f772afb5bc3" />
+
+<br>
 
 ### 분석 결과 예시
 
 - 총 43개 고위험 Endpoint 탐지
 - GET / POST 요청에 위험 Endpoint 집중
 - Internal, Personal 영역에 취약점 다수 분포
+
+<br>
 
 ---
 
@@ -60,7 +76,11 @@
 
 이를 통해 위험한 코드가 배포 단계로 진행되는 것을 방지할 수 있습니다.
 
+<br>
+
 <img width="753" height="87" alt="image" src="https://github.com/user-attachments/assets/510523ed-79b3-45ee-a261-bdd18275714d" />
+
+<br>
 
 ### 적용 정책
 
@@ -71,13 +91,19 @@ Risk Score > Threshold
 → Deployment Blocked
 ```
 
+<br>
+
 ---
 
 ## 📊 Security Dashboard
 
 수집된 취약점 데이터를 기반으로 위험도와 취약점 현황을 실시간으로 시각화하였습니다.
 
+<br>
+
 <img width="753" height="378" alt="image" src="https://github.com/user-attachments/assets/7c787dd5-cfed-4cdd-9101-6e1d4bdd1838" />
+
+<br>
 
 ### Dashboard 주요 정보
 
@@ -87,13 +113,19 @@ Risk Score > Threshold
 - 취약점 추이
 - 취약 패키지 현황
 
+<br>
+
 ---
 
 ## 📦 Top Risk Packages
 
 취약 패키지와 관련 CVE를 분석하여 우선 조치가 필요한 항목을 식별하였습니다.
 
+<br>
+
 <img width="749" height="494" alt="image" src="https://github.com/user-attachments/assets/2ac12588-d179-4289-848f-d7210586ae07" />
+
+<br>
 
 ### 제공 정보
 
@@ -101,6 +133,8 @@ Risk Score > Threshold
 - CVE 정보
 - Severity
 - 위험 점수
+
+<br>
 
 ---
 
@@ -111,6 +145,8 @@ Risk Score > Threshold
 - 취약점 우선순위 산정 자동화
 - Grafana 기반 보안 대시보드 구축
 - CI/CD 환경 내 보안 검증 자동화
+
+<br>
 
 ---
 
@@ -123,6 +159,8 @@ Risk Score > Threshold
 | Backend | Python |
 | Visualization | Grafana |
 | Environment | Docker, Linux |
+
+<br>
 
 ---
 
